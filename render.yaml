@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: happy-day-news-stitcher
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: SWISH_URL
+        value: ""  # Set this in Render dashboard
+      - key: INTRO_URL
+        value: ""  # Set this in Render dashboard
+      - key: OUTRO_URL
+        value: ""  # Set this in Render dashboard
+    # FFmpeg is pre-installed on Render's Python environments
