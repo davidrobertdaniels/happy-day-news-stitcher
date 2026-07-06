@@ -60,8 +60,8 @@ def build_video_from_video_bg(video_path, audio_path, output_path):
         "-map", "1:a",
         "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1",
         "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "23",
+        "-preset", "ultrafast",
+        "-crf", "28",
         "-c:a", "aac",
         "-b:a", "192k",
         "-shortest",
@@ -82,8 +82,8 @@ def build_video_from_image_bg(image_path, audio_path, output_path):
         "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1",
         "-c:v", "libx264",
         "-tune", "stillimage",
-        "-preset", "veryfast",
-        "-crf", "23",
+        "-preset", "ultrafast",
+        "-crf", "28",
         "-c:a", "aac",
         "-b:a", "192k",
         "-pix_fmt", "yuv420p",
@@ -206,10 +206,11 @@ def make_video():
     audio_path = os.path.join(tmpdir, "audio.mp3")
     output_path = os.path.join(tmpdir, f"episode_video_{job_id}.mp4")
 
+    used_fallback = False
+
     try:
         download_file(audio_url, audio_path)
 
-        used_fallback = False
         video_succeeded = False
 
         if video_url:
@@ -220,25 +221,3 @@ def make_video():
                 video_succeeded = True
             except Exception as e:
                 print(f"Video background failed, falling back to image: {e}")
-                used_fallback = True
-
-        if not video_succeeded:
-            if not image_url:
-                return jsonify({"error": "Video background failed and no fallback image configured"}), 500
-            image_path = os.path.join(tmpdir, "background.jpg")
-            download_file(image_url, image_path)
-            build_video_from_image_bg(image_path, audio_path, output_path)
-
-        return send_file(
-            output_path,
-            mimetype="video/mp4",
-            as_attachment=True,
-            download_name=f"happy_day_news_video_{job_id}.mp4"
-        )
-
-    except Exception as e:
-        return jsonify({"error": str(e), "used_fallback": used_fallback if 'used_fallback' in locals() else False}), 500
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
