@@ -130,9 +130,9 @@ def stitch():
             "value": str(stories)[:200]
         }), 400
 
-    if len(stories) != 6:
+    if len(stories) != 5:
         return jsonify({
-            "error": f"Expected 6 story URLs, got {len(stories)}",
+            "error": f"Expected 5 story URLs, got {len(stories)}",
             "stories_received": stories
         }), 400
 
