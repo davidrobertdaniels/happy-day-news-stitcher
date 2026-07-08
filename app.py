@@ -1,5 +1,6 @@
 import os
 import uuid
+import random
 import requests
 import subprocess
 import tempfile
@@ -136,7 +137,12 @@ def stitch():
 
     intro_url = data.get("intro_url") or INTRO_URL
     outro_url = data.get("outro_url") or OUTRO_URL
-    swish_url = data.get("swish_url") or SWISH_URL
+
+    swish_url = data.get("swish_url")
+    if not swish_url:
+        swish_pool = [u.strip() for u in SWISH_URLS.split(',') if u.strip()]
+        if swish_pool:
+            swish_url = random.choice(swish_pool)
 
     if not all([intro_url, outro_url, swish_url]):
         return jsonify({"error": "Missing intro, outro or swish URL"}), 400
