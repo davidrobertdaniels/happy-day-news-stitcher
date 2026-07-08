@@ -130,9 +130,9 @@ def stitch():
             "value": str(stories)[:200]
         }), 400
 
-    if len(stories) != 5:
+    if len(stories) != 6:
         return jsonify({
-            "error": f"Expected 5 story URLs, got {len(stories)}",
+            "error": f"Expected 6 story URLs, got {len(stories)}",
             "stories_received": stories
         }), 400
 
@@ -162,7 +162,7 @@ def stitch():
         download_file(outro_url, outro_path)
         download_file(swish_url, swish_path)
 
-       throw_path = os.path.join(tmpdir, "throw.mp3")
+        throw_path = os.path.join(tmpdir, "throw.mp3")
         download_file(throw_url, throw_path)
 
         story_paths = []
@@ -175,10 +175,10 @@ def stitch():
         last_index = len(story_paths) - 1
         for i, sp in enumerate(story_paths):
             sequence.append(sp)
-            if i < last_index - 1:
-                sequence.append(swish_path)
-            elif i == last_index - 1:
+            if i == last_index - 1:
                 sequence.append(throw_path)
+            elif i < last_index - 1:
+                sequence.append(swish_path)
         sequence.append(outro_path)
 
         stitch_audio(sequence, output_path)
