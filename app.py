@@ -234,7 +234,8 @@ def make_video():
                 build_video_from_video_bg(video_path, audio_path, output_path)
                 video_succeeded = True
             except Exception as e:
-                print(f"Video background failed, falling back to image: {e}") used_fallback = True
+                print(f"Video background failed, falling back to image: {e}")
+                used_fallback = True
 
         if not video_succeeded:
             if not image_url:
