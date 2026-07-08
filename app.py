@@ -7,7 +7,7 @@ from flask import Flask, request, jsonify, send_file
 
 app = Flask(__name__)
 
-SWISH_URL = os.environ.get("SWISH_URL", "")
+SWISH_URLS = os.environ.get("SWISH_URLS", "")
 INTRO_URL = os.environ.get("INTRO_URL", "")
 OUTRO_URL = os.environ.get("OUTRO_URL", "")
 BACKGROUND_VIDEO_URL = os.environ.get("BACKGROUND_VIDEO_URL", "")
