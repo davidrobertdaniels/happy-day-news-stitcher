@@ -9,6 +9,7 @@ from flask import Flask, request, jsonify, send_file
 app = Flask(__name__)
 
 SWISH_URLS = os.environ.get("SWISH_URLS", "")
+THROW_URL = os.environ.get("THROW_URL", "")
 INTRO_URL = os.environ.get("INTRO_URL", "")
 OUTRO_URL = os.environ.get("OUTRO_URL", "")
 BACKGROUND_VIDEO_URL = os.environ.get("BACKGROUND_VIDEO_URL", "")
@@ -137,6 +138,7 @@ def stitch():
 
     intro_url = data.get("intro_url") or INTRO_URL
     outro_url = data.get("outro_url") or OUTRO_URL
+    throw_url = data.get("throw_url") or THROW_URL
 
     swish_url = data.get("swish_url")
     if not swish_url:
@@ -144,8 +146,8 @@ def stitch():
         if swish_pool:
             swish_url = random.choice(swish_pool)
 
-    if not all([intro_url, outro_url, swish_url]):
-        return jsonify({"error": "Missing intro, outro or swish URL"}), 400
+    if not all([intro_url, outro_url, swish_url, throw_url]):
+        return jsonify({"error": "Missing intro, outro, swish, or throw URL"}), 400
 
     job_id = str(uuid.uuid4())[:8]
     tmpdir = tempfile.mkdtemp()
@@ -160,6 +162,9 @@ def stitch():
         download_file(outro_url, outro_path)
         download_file(swish_url, swish_path)
 
+       throw_path = os.path.join(tmpdir, "throw.mp3")
+        download_file(throw_url, throw_path)
+
         story_paths = []
         for i, url in enumerate(stories):
             p = os.path.join(tmpdir, f"story_{i+1}.mp3")
@@ -167,10 +172,13 @@ def stitch():
             story_paths.append(p)
 
         sequence = [intro_path]
+        last_index = len(story_paths) - 1
         for i, sp in enumerate(story_paths):
             sequence.append(sp)
-            if i < len(story_paths) - 1:
+            if i < last_index - 1:
                 sequence.append(swish_path)
+            elif i == last_index - 1:
+                sequence.append(throw_path)
         sequence.append(outro_path)
 
         stitch_audio(sequence, output_path)
