@@ -37,4 +37,4 @@ def stitch_audio(file_paths, output_path):
         ]
         norm_result = subprocess.run(norm_cmd, capture_output=True, text=True)
         if norm_result.returncode != 0:
-            raise RuntimeError(f"FFmpeg
+            raise RuntimeError(f"FFmpeg normalize error on file {idx}: {norm_result.stderr}")
