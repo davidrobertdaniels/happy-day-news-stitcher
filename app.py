@@ -210,31 +210,45 @@ def stitch():
             download_file(url, p)
             story_paths.append(p)
 
-        story_sequence = []
         last_index = len(story_paths) - 1
-        for i, sp in enumerate(story_paths):
-            story_sequence.append(sp)
-            if last_index > 0:
-                if i == last_index - 1:
-                    story_sequence.append(throw_path)
-                elif i < last_index - 1:
-                    story_sequence.append(swish_path)
+        closing_path = story_paths[last_index] if last_index >= 0 else None
+        real_story_paths = story_paths[:last_index] if last_index >= 0 else []
 
-        stories_block_path = os.path.join(tmpdir, "stories_block.mp3")
-        stitch_audio(story_sequence, stories_block_path)
+        real_sequence = []
+        real_last_index = len(real_story_paths) - 1
+        for i, sp in enumerate(real_story_paths):
+            real_sequence.append(sp)
+            if real_last_index > 0 and i < real_last_index:
+                real_sequence.append(swish_path)
 
-        final_stories_block = stories_block_path
-        if beat_url:
-            try:
-                beat_path = os.path.join(tmpdir, "beat.mp3")
-                download_file(beat_url, beat_path)
-                mixed_path = os.path.join(tmpdir, "stories_block_mixed.mp3")
-                mix_beat_under_audio(stories_block_path, beat_path, mixed_path)
-                final_stories_block = mixed_path
-            except Exception as e:
-                print(f"Beat mixing failed, continuing without beat: {e}")
+        final_middle_block = intro_path
 
-        stitch_audio([intro_path, final_stories_block, outro_path], output_path)
+        if real_sequence:
+            stories_block_path = os.path.join(tmpdir, "stories_block.mp3")
+            stitch_audio(real_sequence, stories_block_path)
+
+            final_stories_block = stories_block_path
+            if beat_url:
+                try:
+                    beat_path = os.path.join(tmpdir, "beat.mp3")
+                    download_file(beat_url, beat_path)
+                    mixed_path = os.path.join(tmpdir, "stories_block_mixed.mp3")
+                    mix_beat_under_audio(stories_block_path, beat_path, mixed_path)
+                    final_stories_block = mixed_path
+                except Exception as e:
+                    print(f"Beat mixing failed, continuing without beat: {e}")
+
+            middle_sequence = [intro_path, final_stories_block]
+        else:
+            middle_sequence = [intro_path]
+
+        if closing_path:
+            middle_sequence.append(throw_path)
+            middle_sequence.append(closing_path)
+
+        middle_sequence.append(outro_path)
+
+        stitch_audio(middle_sequence, output_path)
 
         return send_file(
             output_path,
