@@ -26,7 +26,7 @@ def stitch_audio(file_paths, output_path):
     normalized_paths = []
     tmpdir = os.path.dirname(output_path)
     for idx, p in enumerate(file_paths):
-        norm_path = os.path.join(tmpdir, f"norm_{idx}.mp3")
+        norm_path = os.path.join(tmpdir, f"norm_{idx}_{uuid.uuid4().hex[:6]}.mp3")
         norm_cmd = [
             "ffmpeg", "-y",
             "-i", p,
@@ -220,8 +220,6 @@ def stitch():
             real_sequence.append(sp)
             if real_last_index > 0 and i < real_last_index:
                 real_sequence.append(swish_path)
-
-        final_middle_block = intro_path
 
         if real_sequence:
             stories_block_path = os.path.join(tmpdir, "stories_block.mp3")
