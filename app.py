@@ -12,6 +12,7 @@ SWISH_URLS = os.environ.get("SWISH_URLS", "")
 THROW_URL = os.environ.get("THROW_URL", "")
 INTRO_URL = os.environ.get("INTRO_URL", "")
 OUTRO_URL = os.environ.get("OUTRO_URL", "")
+BEAT_URL = os.environ.get("BEAT_URL", "")
 BACKGROUND_VIDEO_URL = os.environ.get("BACKGROUND_VIDEO_URL", "")
 BACKGROUND_IMAGE_URL = os.environ.get("BACKGROUND_IMAGE_URL", "")
 
@@ -59,6 +60,23 @@ def stitch_audio(file_paths, output_path):
         os.unlink(p)
     if result.returncode != 0:
         raise RuntimeError(f"FFmpeg error: {result.stderr}")
+
+def mix_beat_under_audio(voice_path, beat_path, output_path):
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", voice_path,
+        "-stream_loop", "-1",
+        "-i", beat_path,
+        "-filter_complex",
+        "[1:a]volume=0.15[beat];[0:a][beat]amix=inputs=2:duration=first:dropout_transition=2[out]",
+        "-map", "[out]",
+        "-acodec", "libmp3lame",
+        "-q:a", "2",
+        output_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"FFmpeg beat-mix error: {result.stderr}")
 
 def get_audio_duration(audio_path):
     cmd = [
@@ -150,15 +168,16 @@ def stitch():
             "value": str(stories)[:200]
         }), 400
 
-    if len(stories) != 6:
+    if len(stories) < 1:
         return jsonify({
-            "error": f"Expected 6 story URLs, got {len(stories)}",
+            "error": "Expected at least 1 story URL, got 0",
             "stories_received": stories
         }), 400
 
     intro_url = data.get("intro_url") or INTRO_URL
     outro_url = data.get("outro_url") or OUTRO_URL
     throw_url = data.get("throw_url") or THROW_URL
+    beat_url = data.get("beat_url") or BEAT_URL
 
     swish_url = data.get("swish_url")
     if not swish_url:
@@ -191,17 +210,31 @@ def stitch():
             download_file(url, p)
             story_paths.append(p)
 
-        sequence = [intro_path]
+        story_sequence = []
         last_index = len(story_paths) - 1
         for i, sp in enumerate(story_paths):
-            sequence.append(sp)
-            if i == last_index - 1:
-                sequence.append(throw_path)
-            elif i < last_index - 1:
-                sequence.append(swish_path)
-        sequence.append(outro_path)
+            story_sequence.append(sp)
+            if last_index > 0:
+                if i == last_index - 1:
+                    story_sequence.append(throw_path)
+                elif i < last_index - 1:
+                    story_sequence.append(swish_path)
 
-        stitch_audio(sequence, output_path)
+        stories_block_path = os.path.join(tmpdir, "stories_block.mp3")
+        stitch_audio(story_sequence, stories_block_path)
+
+        final_stories_block = stories_block_path
+        if beat_url:
+            try:
+                beat_path = os.path.join(tmpdir, "beat.mp3")
+                download_file(beat_url, beat_path)
+                mixed_path = os.path.join(tmpdir, "stories_block_mixed.mp3")
+                mix_beat_under_audio(stories_block_path, beat_path, mixed_path)
+                final_stories_block = mixed_path
+            except Exception as e:
+                print(f"Beat mixing failed, continuing without beat: {e}")
+
+        stitch_audio([intro_path, final_stories_block, outro_path], output_path)
 
         return send_file(
             output_path,
