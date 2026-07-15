@@ -10,6 +10,7 @@ app = Flask(__name__)
 
 SWISH_URLS = os.environ.get("SWISH_URLS", "")
 THROW_URL = os.environ.get("THROW_URL", "")
+THROW_URLS = os.environ.get("THROW_URLS", "")
 INTRO_URL = os.environ.get("INTRO_URL", "")
 OUTRO_URL = os.environ.get("OUTRO_URL", "")
 BEAT_URL = os.environ.get("BEAT_URL", "")
@@ -30,6 +31,7 @@ def stitch_audio(file_paths, output_path):
         norm_cmd = [
             "ffmpeg", "-y",
             "-i", p,
+            "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
             "-ar", "44100",
             "-ac", "2",
             "-acodec", "libmp3lame",
@@ -176,7 +178,7 @@ def stitch():
 
     intro_url = data.get("intro_url") or INTRO_URL
     outro_url = data.get("outro_url") or OUTRO_URL
-    throw_url = data.get("throw_url") or THROW_URL
+    throw_url = data.get("throw_url")
     beat_url = data.get("beat_url") or BEAT_URL
 
     swish_url = data.get("swish_url")
@@ -184,6 +186,16 @@ def stitch():
         swish_pool = [u.strip() for u in SWISH_URLS.split(',') if u.strip()]
         if swish_pool:
             swish_url = random.choice(swish_pool)
+
+    # Sting/throw pool: alternates between multiple sting options (e.g. two
+    # different intros to segment 6) the same way swish already alternates.
+    # Falls back to the single THROW_URL if THROW_URLS isn't configured.
+    if not throw_url:
+        throw_pool = [u.strip() for u in THROW_URLS.split(',') if u.strip()]
+        if throw_pool:
+            throw_url = random.choice(throw_pool)
+        else:
+            throw_url = THROW_URL
 
     if not all([intro_url, outro_url, swish_url, throw_url]):
         return jsonify({"error": "Missing intro, outro, swish, or throw URL"}), 400
