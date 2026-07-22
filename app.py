@@ -17,11 +17,22 @@ BEAT_URL = os.environ.get("BEAT_URL", "")
 BACKGROUND_VIDEO_URL = os.environ.get("BACKGROUND_VIDEO_URL", "")
 BACKGROUND_IMAGE_URL = os.environ.get("BACKGROUND_IMAGE_URL", "")
 
+FFMPEG_TIMEOUT_SECONDS = 240
+
 def download_file(url, dest_path):
     r = requests.get(url, timeout=60)
     r.raise_for_status()
     with open(dest_path, "wb") as f:
         f.write(r.content)
+
+def run_ffmpeg(cmd, error_label):
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"{error_label}: timed out after {FFMPEG_TIMEOUT_SECONDS}s (likely a bad/unreachable background source, not worth waiting out)")
+    if result.returncode != 0:
+        raise RuntimeError(f"{error_label}: {result.stderr}")
+    return result
 
 def stitch_audio(file_paths, output_path):
     normalized_paths = []
@@ -38,9 +49,7 @@ def stitch_audio(file_paths, output_path):
             "-q:a", "2",
             norm_path
         ]
-        norm_result = subprocess.run(norm_cmd, capture_output=True, text=True)
-        if norm_result.returncode != 0:
-            raise RuntimeError(f"FFmpeg normalize error on file {idx}: {norm_result.stderr}")
+        run_ffmpeg(norm_cmd, f"FFmpeg normalize error on file {idx}")
         normalized_paths.append(norm_path)
 
     list_path = output_path + ".txt"
@@ -56,12 +65,12 @@ def stitch_audio(file_paths, output_path):
         "-q:a", "2",
         output_path
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    os.unlink(list_path)
-    for p in normalized_paths:
-        os.unlink(p)
-    if result.returncode != 0:
-        raise RuntimeError(f"FFmpeg error: {result.stderr}")
+    try:
+        run_ffmpeg(cmd, "FFmpeg error")
+    finally:
+        os.unlink(list_path)
+        for p in normalized_paths:
+            os.unlink(p)
 
 def mix_beat_under_audio(voice_path, beat_path, output_path):
     cmd = [
@@ -76,9 +85,7 @@ def mix_beat_under_audio(voice_path, beat_path, output_path):
         "-q:a", "2",
         output_path
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"FFmpeg beat-mix error: {result.stderr}")
+    run_ffmpeg(cmd, "FFmpeg beat-mix error")
 
 def get_audio_duration(audio_path):
     cmd = [
@@ -87,7 +94,7 @@ def get_audio_duration(audio_path):
         "-of", "default=noprint_wrappers=1:nokey=1",
         audio_path
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if result.returncode != 0:
         raise RuntimeError(f"ffprobe error: {result.stderr}")
     return float(result.stdout.strip())
@@ -111,9 +118,7 @@ def build_video_from_video_bg(video_path, audio_path, output_path):
         "-pix_fmt", "yuv420p",
         output_path
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"FFmpeg video-bg error: {result.stderr}")
+    run_ffmpeg(cmd, "FFmpeg video-bg error")
 
 def build_video_from_image_bg(image_path, audio_path, output_path):
     cmd = [
@@ -133,9 +138,7 @@ def build_video_from_image_bg(image_path, audio_path, output_path):
         "-movflags", "+faststart",
         output_path
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"FFmpeg image-bg error: {result.stderr}")
+    run_ffmpeg(cmd, "FFmpeg image-bg error")
 
 def build_video_from_multi_image_bg(image_paths, audio_path, output_path, transition_duration=0.75):
     """
@@ -153,8 +156,6 @@ def build_video_from_multi_image_bg(image_paths, audio_path, output_path, transi
 
     total_duration = get_audio_duration(audio_path)
     per_image_share = total_duration / n
-    # Each image is held slightly longer than its even share so there's
-    # material left over for the crossfade to blend into the next one.
     segment_duration = per_image_share + transition_duration
 
     inputs = []
@@ -200,9 +201,7 @@ def build_video_from_multi_image_bg(image_paths, audio_path, output_path, transi
         "-movflags", "+faststart",
         output_path
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"FFmpeg multi-image slideshow error: {result.stderr}")
+    run_ffmpeg(cmd, "FFmpeg multi-image slideshow error")
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -350,11 +349,20 @@ def make_video():
     if not audio_url:
         return jsonify({"error": "Missing 'audio_url' in JSON"}), 400
 
-    video_url = data.get("video_url") or BACKGROUND_VIDEO_URL
     image_urls = data.get("image_urls")
+    has_explicit_image_urls = isinstance(image_urls, list) and len(image_urls) > 0
+
+    # If the caller explicitly sent image_urls, that always wins — it should
+    # never be silently overridden by a leftover BACKGROUND_VIDEO_URL env var.
+    # video_url is only considered at all when image_urls wasn't provided.
+    if has_explicit_image_urls:
+        video_url = None
+    else:
+        video_url = data.get("video_url") or BACKGROUND_VIDEO_URL
+
     image_url = data.get("image_url") or BACKGROUND_IMAGE_URL
 
-    if not video_url and not image_urls and not image_url:
+    if not video_url and not has_explicit_image_urls and not image_url:
         return jsonify({"error": "No background video, image, or image list URL configured"}), 400
 
     job_id = str(uuid.uuid4())[:8]
@@ -380,7 +388,7 @@ def make_video():
                 used_fallback = True
 
         if not video_succeeded:
-            if image_urls and isinstance(image_urls, list) and len(image_urls) > 0:
+            if has_explicit_image_urls:
                 image_paths = []
                 for i, url in enumerate(image_urls):
                     img_path = os.path.join(tmpdir, f"slide_{i}.jpg")
