@@ -137,6 +137,73 @@ def build_video_from_image_bg(image_path, audio_path, output_path):
     if result.returncode != 0:
         raise RuntimeError(f"FFmpeg image-bg error: {result.stderr}")
 
+def build_video_from_multi_image_bg(image_paths, audio_path, output_path, transition_duration=0.75):
+    """
+    Builds a crossfade slideshow from multiple images, timed to fill the
+    full duration of audio_path, with a short crossfade blend between
+    consecutive images.
+    """
+    n = len(image_paths)
+    if n < 1:
+        raise RuntimeError("At least one image is required for a slideshow")
+
+    if n == 1:
+        build_video_from_image_bg(image_paths[0], audio_path, output_path)
+        return
+
+    total_duration = get_audio_duration(audio_path)
+    per_image_share = total_duration / n
+    # Each image is held slightly longer than its even share so there's
+    # material left over for the crossfade to blend into the next one.
+    segment_duration = per_image_share + transition_duration
+
+    inputs = []
+    for p in image_paths:
+        inputs += ["-loop", "1", "-t", f"{segment_duration:.3f}", "-i", p]
+
+    filter_parts = []
+    for i in range(n):
+        filter_parts.append(
+            f"[{i}:v]scale=1080:1920:force_original_aspect_ratio=increase,"
+            f"crop=1080:1920,setsar=1,fps=30[v{i}]"
+        )
+
+    current_label = "v0"
+    cumulative_offset = per_image_share - transition_duration
+    if cumulative_offset < 0:
+        cumulative_offset = 0
+    for i in range(1, n):
+        next_label = f"x{i}" if i < n - 1 else "vout"
+        filter_parts.append(
+            f"[{current_label}][v{i}]xfade=transition=fade:"
+            f"duration={transition_duration:.3f}:offset={cumulative_offset:.3f}[{next_label}]"
+        )
+        current_label = next_label
+        cumulative_offset += per_image_share - transition_duration
+
+    filter_complex = ";".join(filter_parts)
+
+    cmd = [
+        "ffmpeg", "-y",
+        *inputs,
+        "-i", audio_path,
+        "-filter_complex", filter_complex,
+        "-map", f"[{current_label}]",
+        "-map", f"{n}:a",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "28",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-pix_fmt", "yuv420p",
+        "-t", f"{total_duration:.3f}",
+        "-movflags", "+faststart",
+        output_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"FFmpeg multi-image slideshow error: {result.stderr}")
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
@@ -187,9 +254,6 @@ def stitch():
         if swish_pool:
             swish_url = random.choice(swish_pool)
 
-    # Sting/throw pool: alternates between multiple sting options (e.g. two
-    # different intros to segment 6) the same way swish already alternates.
-    # Falls back to the single THROW_URL if THROW_URLS isn't configured.
     if not throw_url:
         throw_pool = [u.strip() for u in THROW_URLS.split(',') if u.strip()]
         if throw_pool:
@@ -287,10 +351,11 @@ def make_video():
         return jsonify({"error": "Missing 'audio_url' in JSON"}), 400
 
     video_url = data.get("video_url") or BACKGROUND_VIDEO_URL
+    image_urls = data.get("image_urls")
     image_url = data.get("image_url") or BACKGROUND_IMAGE_URL
 
-    if not video_url and not image_url:
-        return jsonify({"error": "No background video or image URL configured"}), 400
+    if not video_url and not image_urls and not image_url:
+        return jsonify({"error": "No background video, image, or image list URL configured"}), 400
 
     job_id = str(uuid.uuid4())[:8]
     tmpdir = tempfile.mkdtemp()
@@ -315,11 +380,19 @@ def make_video():
                 used_fallback = True
 
         if not video_succeeded:
-            if not image_url:
-                return jsonify({"error": "Video background failed and no fallback image configured"}), 500
-            image_path = os.path.join(tmpdir, "background.jpg")
-            download_file(image_url, image_path)
-            build_video_from_image_bg(image_path, audio_path, output_path)
+            if image_urls and isinstance(image_urls, list) and len(image_urls) > 0:
+                image_paths = []
+                for i, url in enumerate(image_urls):
+                    img_path = os.path.join(tmpdir, f"slide_{i}.jpg")
+                    download_file(url, img_path)
+                    image_paths.append(img_path)
+                build_video_from_multi_image_bg(image_paths, audio_path, output_path)
+            elif image_url:
+                image_path = os.path.join(tmpdir, "background.jpg")
+                download_file(image_url, image_path)
+                build_video_from_image_bg(image_path, audio_path, output_path)
+            else:
+                return jsonify({"error": "Video background failed and no fallback image(s) configured"}), 500
 
         return send_file(
             output_path,
