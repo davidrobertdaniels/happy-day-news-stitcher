@@ -16,14 +16,19 @@ OUTRO_URL = os.environ.get("OUTRO_URL", "")
 BEAT_URL = os.environ.get("BEAT_URL", "")
 BACKGROUND_VIDEO_URL = os.environ.get("BACKGROUND_VIDEO_URL", "")
 BACKGROUND_IMAGE_URL = os.environ.get("BACKGROUND_IMAGE_URL", "")
+PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
 
 FFMPEG_TIMEOUT_SECONDS = 240
 
-def download_file(url, dest_path):
-    r = requests.get(url, timeout=60)
+def download_file(url, dest_path, headers=None):
+    r = requests.get(url, timeout=60, headers=headers or {})
     r.raise_for_status()
     with open(dest_path, "wb") as f:
         f.write(r.content)
+
+def download_pexels_image(url, dest_path):
+    headers = {"Authorization": PEXELS_API_KEY} if PEXELS_API_KEY else {}
+    download_file(url, dest_path, headers=headers)
 
 def run_ffmpeg(cmd, error_label):
     try:
@@ -141,11 +146,6 @@ def build_video_from_image_bg(image_path, audio_path, output_path):
     run_ffmpeg(cmd, "FFmpeg image-bg error")
 
 def build_video_from_multi_image_bg(image_paths, audio_path, output_path, transition_duration=0.75):
-    """
-    Builds a crossfade slideshow from multiple images, timed to fill the
-    full duration of audio_path, with a short crossfade blend between
-    consecutive images.
-    """
     n = len(image_paths)
     if n < 1:
         raise RuntimeError("At least one image is required for a slideshow")
@@ -352,9 +352,6 @@ def make_video():
     image_urls = data.get("image_urls")
     has_explicit_image_urls = isinstance(image_urls, list) and len(image_urls) > 0
 
-    # If the caller explicitly sent image_urls, that always wins — it should
-    # never be silently overridden by a leftover BACKGROUND_VIDEO_URL env var.
-    # video_url is only considered at all when image_urls wasn't provided.
     if has_explicit_image_urls:
         video_url = None
     else:
@@ -373,29 +370,38 @@ def make_video():
     used_fallback = False
 
     try:
+        print(f"Downloading audio from: {audio_url}")
         download_file(audio_url, audio_path)
+        print(f"Audio downloaded successfully")
 
         video_succeeded = False
 
         if video_url:
             try:
+                print(f"Trying video background: {video_url}")
                 video_path = os.path.join(tmpdir, "background.mp4")
                 download_file(video_url, video_path)
                 build_video_from_video_bg(video_path, audio_path, output_path)
                 video_succeeded = True
+                print(f"Video background succeeded")
             except Exception as e:
                 print(f"Video background failed, falling back to image: {e}")
                 used_fallback = True
 
         if not video_succeeded:
             if has_explicit_image_urls:
+                print(f"Downloading {len(image_urls)} Pexels images")
                 image_paths = []
                 for i, url in enumerate(image_urls):
                     img_path = os.path.join(tmpdir, f"slide_{i}.jpg")
-                    download_file(url, img_path)
+                    download_pexels_image(url, img_path)
+                    print(f"Image {i+1} downloaded")
                     image_paths.append(img_path)
+                print(f"Building multi-image slideshow")
                 build_video_from_multi_image_bg(image_paths, audio_path, output_path)
+                print(f"Slideshow built successfully")
             elif image_url:
+                print(f"Downloading single background image")
                 image_path = os.path.join(tmpdir, "background.jpg")
                 download_file(image_url, image_path)
                 build_video_from_image_bg(image_path, audio_path, output_path)
@@ -410,6 +416,7 @@ def make_video():
         )
 
     except Exception as e:
+        print(f"make-video error: {e}")
         return jsonify({"error": str(e), "used_fallback": used_fallback if 'used_fallback' in locals() else False}), 500
 
 if __name__ == "__main__":
