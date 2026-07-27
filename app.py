@@ -14,6 +14,7 @@ THROW_URLS = os.environ.get("THROW_URLS", "")
 INTRO_URL = os.environ.get("INTRO_URL", "")
 OUTRO_URL = os.environ.get("OUTRO_URL", "")
 BEAT_URL = os.environ.get("BEAT_URL", "")
+TEASER_BEAT_URL = os.environ.get("TEASER_BEAT_URL", "")
 BACKGROUND_VIDEO_URL = os.environ.get("BACKGROUND_VIDEO_URL", "")
 BACKGROUND_IMAGE_URL = os.environ.get("BACKGROUND_IMAGE_URL", "")
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
@@ -34,7 +35,7 @@ def run_ffmpeg(cmd, error_label):
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
-        raise RuntimeError(f"{error_label}: timed out after {FFMPEG_TIMEOUT_SECONDS}s (likely a bad/unreachable background source, not worth waiting out)")
+        raise RuntimeError(f"{error_label}: timed out after {FFMPEG_TIMEOUT_SECONDS}s")
     if result.returncode != 0:
         raise RuntimeError(f"{error_label}: {result.stderr}")
     return result
@@ -77,14 +78,14 @@ def stitch_audio(file_paths, output_path):
         for p in normalized_paths:
             os.unlink(p)
 
-def mix_beat_under_audio(voice_path, beat_path, output_path):
+def mix_beat_under_audio(voice_path, beat_path, output_path, volume="0.15"):
     cmd = [
         "ffmpeg", "-y",
         "-i", voice_path,
         "-stream_loop", "-1",
         "-i", beat_path,
         "-filter_complex",
-        "[1:a]volume=0.15[beat];[0:a][beat]amix=inputs=2:duration=first:dropout_transition=2[out]",
+        f"[1:a]volume={volume}[beat];[0:a][beat]amix=inputs=2:duration=first:dropout_transition=2[out]",
         "-map", "[out]",
         "-acodec", "libmp3lame",
         "-q:a", "2",
@@ -149,7 +150,6 @@ def build_video_from_multi_image_bg(image_paths, audio_path, output_path, transi
     n = len(image_paths)
     if n < 1:
         raise RuntimeError("At least one image is required for a slideshow")
-
     if n == 1:
         build_video_from_image_bg(image_paths[0], audio_path, output_path)
         return
@@ -246,6 +246,7 @@ def stitch():
     outro_url = data.get("outro_url") or OUTRO_URL
     throw_url = data.get("throw_url")
     beat_url = data.get("beat_url") or BEAT_URL
+    teaser_beat_url = data.get("teaser_beat_url") or TEASER_BEAT_URL
 
     swish_url = data.get("swish_url")
     if not swish_url:
@@ -285,9 +286,26 @@ def stitch():
             download_file(url, p)
             story_paths.append(p)
 
+        # story_paths[0] is the teaser segment (index 0)
+        # story_paths[1:-1] are the main story segments
+        # story_paths[-1] is the closing segment (index 6)
+        teaser_path = story_paths[0] if len(story_paths) > 0 else None
         last_index = len(story_paths) - 1
-        closing_path = story_paths[last_index] if last_index >= 0 else None
-        real_story_paths = story_paths[:last_index] if last_index >= 0 else []
+        closing_path = story_paths[last_index] if last_index >= 1 else None
+        real_story_paths = story_paths[1:last_index] if last_index >= 1 else []
+
+        # Mix teaser beat under teaser segment if available
+        final_teaser_path = teaser_path
+        if teaser_path and teaser_beat_url:
+            try:
+                teaser_beat_path = os.path.join(tmpdir, "teaser_beat.mp3")
+                download_file(teaser_beat_url, teaser_beat_path)
+                mixed_teaser_path = os.path.join(tmpdir, "teaser_mixed.mp3")
+                mix_beat_under_audio(teaser_path, teaser_beat_path, mixed_teaser_path, volume="0.2")
+                final_teaser_path = mixed_teaser_path
+                print("Teaser beat mixed successfully")
+            except Exception as e:
+                print(f"Teaser beat mixing failed, using dry teaser: {e}")
 
         real_sequence = []
         real_last_index = len(real_story_paths) - 1
@@ -311,9 +329,14 @@ def stitch():
                 except Exception as e:
                     print(f"Beat mixing failed, continuing without beat: {e}")
 
-            middle_sequence = [intro_path, final_stories_block]
+            middle_sequence = [intro_path]
+            if final_teaser_path:
+                middle_sequence.append(final_teaser_path)
+            middle_sequence.append(final_stories_block)
         else:
             middle_sequence = [intro_path]
+            if final_teaser_path:
+                middle_sequence.append(final_teaser_path)
 
         if closing_path:
             middle_sequence.append(throw_path)
