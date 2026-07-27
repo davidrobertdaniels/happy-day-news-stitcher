@@ -93,6 +93,23 @@ def mix_beat_under_audio(voice_path, beat_path, output_path, volume="0.15"):
     ]
     run_ffmpeg(cmd, "FFmpeg beat-mix error")
 
+def apply_fade_out(input_path, output_path, fade_duration=0.24):
+    """
+    Apply a short fade out to the end of an audio file.
+    Default fade_duration is 0.24s (approx 6 frames at 25fps).
+    """
+    duration = get_audio_duration(input_path)
+    fade_start = max(0, duration - fade_duration)
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-af", f"afade=t=out:st={fade_start:.3f}:d={fade_duration:.3f}",
+        "-acodec", "libmp3lame",
+        "-q:a", "2",
+        output_path
+    ]
+    run_ffmpeg(cmd, "FFmpeg fade-out error")
+
 def get_audio_duration(audio_path):
     cmd = [
         "ffprobe", "-v", "error",
@@ -286,9 +303,9 @@ def stitch():
             download_file(url, p)
             story_paths.append(p)
 
-        # story_paths[0] is the teaser segment (index 0)
+        # story_paths[0] is the teaser segment
         # story_paths[1:-1] are the main story segments
-        # story_paths[-1] is the closing segment (index 6)
+        # story_paths[-1] is the closing segment
         teaser_path = story_paths[0] if len(story_paths) > 0 else None
         last_index = len(story_paths) - 1
         closing_path = story_paths[last_index] if last_index >= 1 else None
@@ -306,6 +323,18 @@ def stitch():
                 print("Teaser beat mixed successfully")
             except Exception as e:
                 print(f"Teaser beat mixing failed, using dry teaser: {e}")
+
+        # Apply fade out to the last main story segment (seg 5)
+        # before the throw sting fires — 6 frames at 25fps = ~0.24s
+        if real_story_paths:
+            last_story_path = real_story_paths[-1]
+            faded_last_story_path = os.path.join(tmpdir, "last_story_faded.mp3")
+            try:
+                apply_fade_out(last_story_path, faded_last_story_path, fade_duration=0.24)
+                real_story_paths[-1] = faded_last_story_path
+                print("Fade out applied to last story segment")
+            except Exception as e:
+                print(f"Fade out failed, using original: {e}")
 
         real_sequence = []
         real_last_index = len(real_story_paths) - 1
