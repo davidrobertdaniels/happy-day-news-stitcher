@@ -340,7 +340,7 @@ def stitch():
                 teaser_music_path = os.path.join(tmpdir, "teaser_music.mp3")
                 download_file(teaser_music_url, teaser_music_path)
                 mixed_teaser_path = os.path.join(tmpdir, "teaser_mixed.mp3")
-                mix_beat_under_audio(dry_teaser_path, teaser_music_path, mixed_teaser_path, volume="0.2")
+                mix_beat_under_audio(dry_teaser_path, teaser_music_path, mixed_teaser_path, volume="0.12")
                 final_teaser_path = mixed_teaser_path
                 print("Teaser music mixed successfully")
             except Exception as e:
