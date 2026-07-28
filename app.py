@@ -17,6 +17,7 @@ BEAT_URL = os.environ.get("BEAT_URL", "")
 TEASER_BEAT_URL = os.environ.get("TEASER_BEAT_URL", "")
 TEASER_MUSIC_URL = os.environ.get("TEASER_MUSIC_URL", "")
 INTRO_SWISH_URL = os.environ.get("INTRO_SWISH_URL", "")
+BUT_FIRST_SWISH_URL = os.environ.get("BUT_FIRST_SWISH_URL", "")
 BACKGROUND_VIDEO_URL = os.environ.get("BACKGROUND_VIDEO_URL", "")
 BACKGROUND_IMAGE_URL = os.environ.get("BACKGROUND_IMAGE_URL", "")
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
@@ -256,8 +257,11 @@ def stitch():
     beat_url = data.get("beat_url") or BEAT_URL
     teaser_music_url = data.get("teaser_music_url") or TEASER_MUSIC_URL
 
-    # Intro swish — used between teaser segments only
+    # Intro swish — used between teaser lines (leadIn through tease4)
     intro_swish_url = data.get("intro_swish_url") or INTRO_SWISH_URL
+
+    # But-first swish — used specifically after the "But first," segment
+    but_first_swish_url = data.get("but_first_swish_url") or BUT_FIRST_SWISH_URL
 
     # Story swish — used between main story segments (unchanged)
     swish_url = data.get("swish_url")
@@ -301,6 +305,14 @@ def stitch():
             intro_swish_path = os.path.join(tmpdir, "intro_swish.mp3")
             download_file(intro_swish_url, intro_swish_path)
 
+        # Download but-first swish if available, otherwise fall back to intro swish
+        but_first_swish_path = None
+        if but_first_swish_url:
+            but_first_swish_path = os.path.join(tmpdir, "but_first_swish.mp3")
+            download_file(but_first_swish_url, but_first_swish_path)
+        elif intro_swish_path:
+            but_first_swish_path = intro_swish_path
+
         # Download all voiced segments
         story_paths = []
         for i, url in enumerate(stories):
@@ -315,15 +327,25 @@ def stitch():
         real_story_paths = remaining_paths[:-1] if len(remaining_paths) > 1 else []
 
         # ── BUILD TEASER BLOCK ────────────────────────────────────────────────
-        # Interleave intro swish between each teaser segment:
-        # [leadIn] [swish] [tease1] [swish] [tease2] [swish] [tease3] [swish]
-        # [tease4] [swish] [butFirst] [swish]
+        # Sequence:
+        # [leadIn] [intro_swish] [tease1] [intro_swish] [tease2] [intro_swish]
+        # [tease3] [intro_swish] [tease4] [intro_swish] [butFirst] [but_first_swish]
+        #
+        # The last segment in teaser_paths is always "But first," — it gets
+        # but_first_swish after it. All others get intro_swish after them.
         teaser_sequence = []
         if teaser_paths:
             if intro_swish_path:
-                for tp in teaser_paths:
+                last_teaser_idx = len(teaser_paths) - 1
+                for i, tp in enumerate(teaser_paths):
                     teaser_sequence.append(tp)
-                    teaser_sequence.append(intro_swish_path)
+                    if i == last_teaser_idx:
+                        # "But first," segment — use but_first_swish
+                        if but_first_swish_path:
+                            teaser_sequence.append(but_first_swish_path)
+                    else:
+                        # All other teaser lines — use intro_swish
+                        teaser_sequence.append(intro_swish_path)
             else:
                 teaser_sequence = list(teaser_paths)
 
@@ -333,7 +355,7 @@ def stitch():
             dry_teaser_path = os.path.join(tmpdir, "teaser_dry.mp3")
             stitch_audio(teaser_sequence, dry_teaser_path)
 
-        # Mix new teaser music under the assembled teaser block
+        # Mix teaser music under the assembled teaser block
         final_teaser_path = dry_teaser_path
         if dry_teaser_path and teaser_music_url:
             try:
