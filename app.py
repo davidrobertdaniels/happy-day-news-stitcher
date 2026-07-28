@@ -15,6 +15,8 @@ INTRO_URL = os.environ.get("INTRO_URL", "")
 OUTRO_URL = os.environ.get("OUTRO_URL", "")
 BEAT_URL = os.environ.get("BEAT_URL", "")
 TEASER_BEAT_URL = os.environ.get("TEASER_BEAT_URL", "")
+TEASER_MUSIC_URL = os.environ.get("TEASER_MUSIC_URL", "")
+INTRO_SWISH_URL = os.environ.get("INTRO_SWISH_URL", "")
 BACKGROUND_VIDEO_URL = os.environ.get("BACKGROUND_VIDEO_URL", "")
 BACKGROUND_IMAGE_URL = os.environ.get("BACKGROUND_IMAGE_URL", "")
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
@@ -94,10 +96,6 @@ def mix_beat_under_audio(voice_path, beat_path, output_path, volume="0.15"):
     run_ffmpeg(cmd, "FFmpeg beat-mix error")
 
 def apply_fade_out(input_path, output_path, fade_duration=0.24):
-    """
-    Apply a short fade out to the end of an audio file.
-    Default fade_duration is 0.24s (approx 6 frames at 25fps).
-    """
     duration = get_audio_duration(input_path)
     fade_start = max(0, duration - fade_duration)
     cmd = [
@@ -238,8 +236,6 @@ def stitch():
             "content_type": request.content_type
         }), 400
 
-    print(f"Parsed data keys: {list(data.keys())}")
-
     if "stories" not in data:
         return jsonify({
             "error": "Missing 'stories' key in JSON",
@@ -247,24 +243,23 @@ def stitch():
         }), 400
 
     stories = data["stories"]
-    if not isinstance(stories, list):
-        return jsonify({
-            "error": f"'stories' must be an array, got {type(stories).__name__}",
-            "value": str(stories)[:200]
-        }), 400
+    if not isinstance(stories, list) or len(stories) < 1:
+        return jsonify({"error": "Expected at least 1 story URL"}), 400
 
-    if len(stories) < 1:
-        return jsonify({
-            "error": "Expected at least 1 story URL, got 0",
-            "stories_received": stories
-        }), 400
+    # teaserSegmentCount tells us how many items at the front of stories[]
+    # are teaser voice segments. Default 1 for backwards compatibility.
+    teaser_segment_count = int(data.get("teaserSegmentCount", 1))
 
     intro_url = data.get("intro_url") or INTRO_URL
     outro_url = data.get("outro_url") or OUTRO_URL
     throw_url = data.get("throw_url")
     beat_url = data.get("beat_url") or BEAT_URL
-    teaser_beat_url = data.get("teaser_beat_url") or TEASER_BEAT_URL
+    teaser_music_url = data.get("teaser_music_url") or TEASER_MUSIC_URL
 
+    # Intro swish — used between teaser segments only
+    intro_swish_url = data.get("intro_swish_url") or INTRO_SWISH_URL
+
+    # Story swish — used between main story segments (unchanged)
     swish_url = data.get("swish_url")
     if not swish_url:
         swish_pool = [u.strip() for u in SWISH_URLS.split(',') if u.strip()]
@@ -278,54 +273,81 @@ def stitch():
         else:
             throw_url = THROW_URL
 
-    if not all([intro_url, outro_url, swish_url, throw_url]):
-        return jsonify({"error": "Missing intro, outro, swish, or throw URL"}), 400
+    if not all([intro_url, outro_url, throw_url]):
+        return jsonify({"error": "Missing intro, outro, or throw URL"}), 400
 
     job_id = str(uuid.uuid4())[:8]
     tmpdir = tempfile.mkdtemp()
     output_path = os.path.join(tmpdir, f"episode_{job_id}.mp3")
 
     try:
+        # Download fixed assets
         intro_path = os.path.join(tmpdir, "intro.mp3")
         outro_path = os.path.join(tmpdir, "outro.mp3")
-        swish_path = os.path.join(tmpdir, "swish.mp3")
-
+        throw_path = os.path.join(tmpdir, "throw.mp3")
         download_file(intro_url, intro_path)
         download_file(outro_url, outro_path)
-        download_file(swish_url, swish_path)
-
-        throw_path = os.path.join(tmpdir, "throw.mp3")
         download_file(throw_url, throw_path)
 
+        # Download story swish if available
+        swish_path = None
+        if swish_url:
+            swish_path = os.path.join(tmpdir, "swish.mp3")
+            download_file(swish_url, swish_path)
+
+        # Download intro swish if available
+        intro_swish_path = None
+        if intro_swish_url:
+            intro_swish_path = os.path.join(tmpdir, "intro_swish.mp3")
+            download_file(intro_swish_url, intro_swish_path)
+
+        # Download all voiced segments
         story_paths = []
         for i, url in enumerate(stories):
             p = os.path.join(tmpdir, f"story_{i+1}.mp3")
             download_file(url, p)
             story_paths.append(p)
 
-        # story_paths[0] is the teaser segment
-        # story_paths[1:-1] are the main story segments
-        # story_paths[-1] is the closing segment
-        teaser_path = story_paths[0] if len(story_paths) > 0 else None
-        last_index = len(story_paths) - 1
-        closing_path = story_paths[last_index] if last_index >= 1 else None
-        real_story_paths = story_paths[1:last_index] if last_index >= 1 else []
+        # Split into teaser segments, main story segments, closing segment
+        teaser_paths = story_paths[:teaser_segment_count]
+        remaining_paths = story_paths[teaser_segment_count:]
+        closing_path = remaining_paths[-1] if len(remaining_paths) >= 1 else None
+        real_story_paths = remaining_paths[:-1] if len(remaining_paths) > 1 else []
 
-        # Mix teaser beat under teaser segment if available
-        final_teaser_path = teaser_path
-        if teaser_path and teaser_beat_url:
+        # ── BUILD TEASER BLOCK ────────────────────────────────────────────────
+        # Interleave intro swish between each teaser segment:
+        # [leadIn] [swish] [tease1] [swish] [tease2] [swish] [tease3] [swish]
+        # [tease4] [swish] [butFirst] [swish]
+        teaser_sequence = []
+        if teaser_paths:
+            if intro_swish_path:
+                for tp in teaser_paths:
+                    teaser_sequence.append(tp)
+                    teaser_sequence.append(intro_swish_path)
+            else:
+                teaser_sequence = list(teaser_paths)
+
+        # Stitch raw teaser voice + swishes together
+        dry_teaser_path = None
+        if teaser_sequence:
+            dry_teaser_path = os.path.join(tmpdir, "teaser_dry.mp3")
+            stitch_audio(teaser_sequence, dry_teaser_path)
+
+        # Mix new teaser music under the assembled teaser block
+        final_teaser_path = dry_teaser_path
+        if dry_teaser_path and teaser_music_url:
             try:
-                teaser_beat_path = os.path.join(tmpdir, "teaser_beat.mp3")
-                download_file(teaser_beat_url, teaser_beat_path)
+                teaser_music_path = os.path.join(tmpdir, "teaser_music.mp3")
+                download_file(teaser_music_url, teaser_music_path)
                 mixed_teaser_path = os.path.join(tmpdir, "teaser_mixed.mp3")
-                mix_beat_under_audio(teaser_path, teaser_beat_path, mixed_teaser_path, volume="0.2")
+                mix_beat_under_audio(dry_teaser_path, teaser_music_path, mixed_teaser_path, volume="0.2")
                 final_teaser_path = mixed_teaser_path
-                print("Teaser beat mixed successfully")
+                print("Teaser music mixed successfully")
             except Exception as e:
-                print(f"Teaser beat mixing failed, using dry teaser: {e}")
+                print(f"Teaser music mixing failed, using dry teaser: {e}")
 
-        # Apply fade out to the last main story segment (seg 5)
-        # before the throw sting fires — 6 frames at 25fps = ~0.24s
+        # ── BUILD MAIN STORIES BLOCK ──────────────────────────────────────────
+        # Apply fade out to last story segment before throw sting
         if real_story_paths:
             last_story_path = real_story_paths[-1]
             faded_last_story_path = os.path.join(tmpdir, "last_story_faded.mp3")
@@ -336,13 +358,15 @@ def stitch():
             except Exception as e:
                 print(f"Fade out failed, using original: {e}")
 
+        # Interleave story swishes between main story segments
         real_sequence = []
         real_last_index = len(real_story_paths) - 1
         for i, sp in enumerate(real_story_paths):
             real_sequence.append(sp)
-            if real_last_index > 0 and i < real_last_index:
+            if swish_path and real_last_index > 0 and i < real_last_index:
                 real_sequence.append(swish_path)
 
+        final_stories_block = None
         if real_sequence:
             stories_block_path = os.path.join(tmpdir, "stories_block.mp3")
             stitch_audio(real_sequence, stories_block_path)
@@ -358,22 +382,19 @@ def stitch():
                 except Exception as e:
                     print(f"Beat mixing failed, continuing without beat: {e}")
 
-            middle_sequence = [intro_path]
-            if final_teaser_path:
-                middle_sequence.append(final_teaser_path)
-            middle_sequence.append(final_stories_block)
-        else:
-            middle_sequence = [intro_path]
-            if final_teaser_path:
-                middle_sequence.append(final_teaser_path)
-
+        # ── ASSEMBLE FINAL EPISODE ────────────────────────────────────────────
+        # [intro] [teaser+music] [stories+beat] [throw] [closing] [outro]
+        final_sequence = [intro_path]
+        if final_teaser_path:
+            final_sequence.append(final_teaser_path)
+        if final_stories_block:
+            final_sequence.append(final_stories_block)
         if closing_path:
-            middle_sequence.append(throw_path)
-            middle_sequence.append(closing_path)
+            final_sequence.append(throw_path)
+            final_sequence.append(closing_path)
+        final_sequence.append(outro_path)
 
-        middle_sequence.append(outro_path)
-
-        stitch_audio(middle_sequence, output_path)
+        stitch_audio(final_sequence, output_path)
 
         return send_file(
             output_path,
