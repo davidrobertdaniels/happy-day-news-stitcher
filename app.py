@@ -135,6 +135,32 @@ def mix_beat_under_audio(voice_path, beat_path, output_path, volume="0.15"):
     ]
     run_ffmpeg(cmd, "FFmpeg beat-mix error")
 
+def mix_beat_under_audio_with_tail(voice_path, beat_path, output_path, volume="0.15", tail_seconds=0.5, fade_duration=0.5):
+    """Mix beat under voice, extend beat by tail_seconds past voice end, then fade out."""
+    voice_duration = get_audio_duration(voice_path)
+    total_duration = voice_duration + tail_seconds
+    fade_start = total_duration - fade_duration
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", voice_path,
+        "-stream_loop", "-1",
+        "-i", beat_path,
+        "-filter_complex",
+        (
+            f"[0:a]apad=pad_dur={tail_seconds}[voice_padded];"
+            f"[1:a]volume={volume}[beat_vol];"
+            f"[voice_padded][beat_vol]amix=inputs=2:duration=first:dropout_transition=0[mixed];"
+            f"[mixed]afade=t=out:st={fade_start:.3f}:d={fade_duration:.3f}[out]"
+        ),
+        "-map", "[out]",
+        "-t", f"{total_duration:.3f}",
+        "-acodec", "libmp3lame",
+        "-q:a", "2",
+        output_path
+    ]
+    run_ffmpeg(cmd, "FFmpeg beat-mix-with-tail error")
+
 def apply_fade_out(input_path, output_path, fade_duration=0.24):
     duration = get_audio_duration(input_path)
     fade_start = max(0, duration - fade_duration)
@@ -295,13 +321,9 @@ def stitch():
     teaser_music_url = data.get("teaser_music_url") or TEASER_MUSIC_URL
     closing_beat_url = data.get("closing_beat_url") or CLOSING_BEAT_URL
 
-    # Intro swish — between teaser lines
     intro_swish_url = data.get("intro_swish_url") or INTRO_SWISH_URL
-
-    # But-first swish — after the "But first," segment specifically
     but_first_swish_url = data.get("but_first_swish_url") or BUT_FIRST_SWISH_URL
 
-    # Story swish — between main story segments
     swish_url = data.get("swish_url")
     if not swish_url:
         swish_pool = [u.strip() for u in SWISH_URLS.split(',') if u.strip()]
@@ -323,7 +345,6 @@ def stitch():
     output_path = os.path.join(tmpdir, f"episode_{job_id}.mp3")
 
     try:
-        # Download fixed assets
         intro_path = os.path.join(tmpdir, "intro.mp3")
         outro_path = os.path.join(tmpdir, "outro.mp3")
         throw_path = os.path.join(tmpdir, "throw.mp3")
@@ -331,19 +352,16 @@ def stitch():
         download_file(outro_url, outro_path)
         download_file(throw_url, throw_path)
 
-        # Download story swish if available
         swish_path = None
         if swish_url:
             swish_path = os.path.join(tmpdir, "swish.mp3")
             download_file(swish_url, swish_path)
 
-        # Download intro swish if available
         intro_swish_path = None
         if intro_swish_url:
             intro_swish_path = os.path.join(tmpdir, "intro_swish.mp3")
             download_file(intro_swish_url, intro_swish_path)
 
-        # Download but-first swish, fall back to intro swish if not set
         but_first_swish_path = None
         if but_first_swish_url:
             but_first_swish_path = os.path.join(tmpdir, "but_first_swish.mp3")
@@ -351,24 +369,18 @@ def stitch():
         elif intro_swish_path:
             but_first_swish_path = intro_swish_path
 
-        # Download all voiced segments
         story_paths = []
         for i, url in enumerate(stories):
             p = os.path.join(tmpdir, f"story_{i+1}.mp3")
             download_file(url, p)
             story_paths.append(p)
 
-        # Split into teaser segments, main story segments, closing segment
         teaser_paths = story_paths[:teaser_segment_count]
         remaining_paths = story_paths[teaser_segment_count:]
         closing_path = remaining_paths[-1] if len(remaining_paths) >= 1 else None
         real_story_paths = remaining_paths[:-1] if len(remaining_paths) > 1 else []
 
         # ── BUILD TEASER BLOCK ────────────────────────────────────────────────
-        # Interleave swishes between teaser segments — no per-clip normalisation.
-        # The whole block is normalised as one unit after stitching so that
-        # short clips ("But first,") and long clips get treated consistently,
-        # preventing volume fluctuation when music is mixed under.
         teaser_sequence = []
         if teaser_paths:
             if intro_swish_path:
@@ -385,15 +397,12 @@ def stitch():
 
         final_teaser_path = None
         if teaser_sequence:
-            # Step 1 — raw stitch (no per-clip normalisation)
             raw_teaser_path = os.path.join(tmpdir, "teaser_raw.mp3")
             stitch_audio_raw(teaser_sequence, raw_teaser_path)
 
-            # Step 2 — normalise the whole block as one unit
             norm_teaser_path = os.path.join(tmpdir, "teaser_norm.mp3")
             normalise_audio(raw_teaser_path, norm_teaser_path)
 
-            # Step 3 — mix music under the normalised block
             final_teaser_path = norm_teaser_path
             if teaser_music_url:
                 try:
@@ -406,22 +415,28 @@ def stitch():
                 except Exception as e:
                     print(f"Teaser music mixing failed, using dry teaser: {e}")
 
-        # ── BUILD CLOSING SEGMENT WITH BEAT ──────────────────────────────────
-        # Mix closing beat under segment 6 (joke/affirmation) if available
+        # ── BUILD CLOSING SEGMENT WITH BEAT AND TAIL ─────────────────────────
+        # Voice plays, beat continues for 0.5s after voice ends, then fades out
         final_closing_path = closing_path
         if closing_path and closing_beat_url:
             try:
                 closing_beat_path = os.path.join(tmpdir, "closing_beat.mp3")
                 download_file(closing_beat_url, closing_beat_path)
                 mixed_closing_path = os.path.join(tmpdir, "closing_mixed.mp3")
-                mix_beat_under_audio(closing_path, closing_beat_path, mixed_closing_path, volume="0.15")
+                mix_beat_under_audio_with_tail(
+                    closing_path,
+                    closing_beat_path,
+                    mixed_closing_path,
+                    volume="0.15",
+                    tail_seconds=0.5,
+                    fade_duration=0.5
+                )
                 final_closing_path = mixed_closing_path
-                print("Closing beat mixed successfully")
+                print("Closing beat mixed with tail successfully")
             except Exception as e:
                 print(f"Closing beat mixing failed, using dry closing: {e}")
 
         # ── BUILD MAIN STORIES BLOCK ──────────────────────────────────────────
-        # Apply fade out to last story segment before throw sting
         if real_story_paths:
             last_story_path = real_story_paths[-1]
             faded_last_story_path = os.path.join(tmpdir, "last_story_faded.mp3")
@@ -432,7 +447,6 @@ def stitch():
             except Exception as e:
                 print(f"Fade out failed, using original: {e}")
 
-        # Interleave story swishes between main story segments
         real_sequence = []
         real_last_index = len(real_story_paths) - 1
         for i, sp in enumerate(real_story_paths):
@@ -457,7 +471,7 @@ def stitch():
                     print(f"Beat mixing failed, continuing without beat: {e}")
 
         # ── ASSEMBLE FINAL EPISODE ────────────────────────────────────────────
-        # [intro] [teaser+music] [stories+beat] [throw] [closing+beat] [outro]
+        # [intro] [teaser+music] [stories+beat] [throw] [closing+beat+tail] [outro]
         final_sequence = [intro_path]
         if final_teaser_path:
             final_sequence.append(final_teaser_path)
