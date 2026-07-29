@@ -387,13 +387,13 @@ def stitch():
         if teaser_paths:
             if intro_swish_path:
                 last_teaser_idx = len(teaser_paths) - 1
-                for i, tp in enumerate(teaser_paths):
-                    teaser_sequence.append(tp)
-                    if i == last_teaser_idx:
-                        if but_first_swish_path:
-                            teaser_sequence.append(but_first_swish_path)
-                    else:
-                        teaser_sequence.append(intro_swish_path)
+for i, tp in enumerate(teaser_paths):
+    teaser_sequence.append(tp)
+    if i == last_teaser_idx:
+        # No swish after "But first," — it leads directly into story 1
+        pass
+    else:
+        teaser_sequence.append(intro_swish_path)
             else:
                 teaser_sequence = list(teaser_paths)
 
