@@ -323,8 +323,9 @@ def stitch():
     teaser_music_url = data.get("teaser_music_url") or TEASER_MUSIC_URL
     closing_beat_url = data.get("closing_beat_url") or CLOSING_BEAT_URL
 
+    # intro_swish — new audio, plays after leadIn and between each tease line,
+    # and once more before "But first,". Nothing plays after "But first,".
     intro_swish_url = data.get("intro_swish_url") or INTRO_SWISH_URL
-    but_first_swish_url = data.get("but_first_swish_url") or BUT_FIRST_SWISH_URL
 
     swish_url = data.get("swish_url")
     if not swish_url:
@@ -364,13 +365,6 @@ def stitch():
             intro_swish_path = os.path.join(tmpdir, "intro_swish.mp3")
             download_file(intro_swish_url, intro_swish_path)
 
-        but_first_swish_path = None
-        if but_first_swish_url:
-            but_first_swish_path = os.path.join(tmpdir, "but_first_swish.mp3")
-            download_file(but_first_swish_url, but_first_swish_path)
-        elif intro_swish_path:
-            but_first_swish_path = intro_swish_path
-
         story_paths = []
         for i, url in enumerate(stories):
             p = os.path.join(tmpdir, f"story_{i+1}.mp3")
@@ -383,21 +377,39 @@ def stitch():
         real_story_paths = remaining_paths[:-1] if len(remaining_paths) > 1 else []
 
         # ── BUILD TEASER BLOCK ────────────────────────────────────────────────
-        # Swish between each tease line but NOT after "But first," —
-        # "But first," leads directly into story 1 with no swish
+        # Sequence:
+        # [leadIn] [swish] [tease1] [swish] [tease2] [swish] [tease3] [swish] [tease4] [swish] [But first,]
+        #
+        # Swish plays after every teaser segment including after tease4
+        # and before "But first,". Nothing plays after "But first,".
         teaser_sequence = []
         if teaser_paths:
-            if intro_swish_path:
-                last_teaser_idx = len(teaser_paths) - 1
-                for i, tp in enumerate(teaser_paths):
-                    teaser_sequence.append(tp)
-                    if i == last_teaser_idx:
-                        # No swish after "But first," — leads directly into story 1
-                        pass
-                    else:
+            last_teaser_idx = len(teaser_paths) - 1
+            for i, tp in enumerate(teaser_paths):
+                teaser_sequence.append(tp)
+                if i < last_teaser_idx:
+                    # Swish after each tease line (not after "But first,")
+                    if intro_swish_path:
                         teaser_sequence.append(intro_swish_path)
-            else:
-                teaser_sequence = list(teaser_paths)
+                # No swish after "But first," — leads directly into story 1
+        else:
+            teaser_sequence = list(teaser_paths)
+
+        # Insert swish before "But first," (i.e. before the last segment)
+        # by rebuilding with swish between tease4 and But first
+        if teaser_paths and intro_swish_path and len(teaser_paths) > 1:
+            rebuilt = []
+            last_idx = len(teaser_paths) - 1
+            for i, tp in enumerate(teaser_paths):
+                rebuilt.append(tp)
+                if i == last_idx - 1:
+                    # After tease4, add swish before "But first,"
+                    rebuilt.append(intro_swish_path)
+                elif i < last_idx - 1:
+                    # Between other tease lines
+                    rebuilt.append(intro_swish_path)
+                # i == last_idx is "But first," — nothing after it
+            teaser_sequence = rebuilt
 
         final_teaser_path = None
         if teaser_sequence:
