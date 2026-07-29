@@ -161,7 +161,9 @@ def mix_beat_under_audio_with_tail(voice_path, beat_path, output_path, volume="0
     ]
     run_ffmpeg(cmd, "FFmpeg beat-mix-with-tail error")
 
-def apply_fade_out(input_path, output_path, fade_duration=0.24):
+def apply_fade_out(input_path, output_path, fade_duration=1.5):
+    """Apply fade out to end of audio. Default 1.5s for smooth transition
+    before the throw sting fires after the last story segment."""
     duration = get_audio_duration(input_path)
     fade_start = max(0, duration - fade_duration)
     cmd = [
@@ -417,6 +419,7 @@ def stitch():
 
         # ── BUILD CLOSING SEGMENT WITH BEAT AND TAIL ─────────────────────────
         # Voice plays, beat continues for 0.5s after voice ends, then fades out
+        # Volume lowered to 0.10 to sit further under the voice
         final_closing_path = closing_path
         if closing_path and closing_beat_url:
             try:
@@ -427,7 +430,7 @@ def stitch():
                     closing_path,
                     closing_beat_path,
                     mixed_closing_path,
-                    volume="0.15",
+                    volume="0.10",
                     tail_seconds=0.5,
                     fade_duration=0.5
                 )
@@ -437,11 +440,12 @@ def stitch():
                 print(f"Closing beat mixing failed, using dry closing: {e}")
 
         # ── BUILD MAIN STORIES BLOCK ──────────────────────────────────────────
+        # Fade out last story segment over 1.5s before throw sting fires
         if real_story_paths:
             last_story_path = real_story_paths[-1]
             faded_last_story_path = os.path.join(tmpdir, "last_story_faded.mp3")
             try:
-                apply_fade_out(last_story_path, faded_last_story_path, fade_duration=0.24)
+                apply_fade_out(last_story_path, faded_last_story_path, fade_duration=1.5)
                 real_story_paths[-1] = faded_last_story_path
                 print("Fade out applied to last story segment")
             except Exception as e:
