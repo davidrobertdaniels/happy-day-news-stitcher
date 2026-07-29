@@ -383,17 +383,19 @@ def stitch():
         real_story_paths = remaining_paths[:-1] if len(remaining_paths) > 1 else []
 
         # ── BUILD TEASER BLOCK ────────────────────────────────────────────────
+        # Swish between each tease line but NOT after "But first," —
+        # "But first," leads directly into story 1 with no swish
         teaser_sequence = []
         if teaser_paths:
             if intro_swish_path:
                 last_teaser_idx = len(teaser_paths) - 1
-for i, tp in enumerate(teaser_paths):
-    teaser_sequence.append(tp)
-    if i == last_teaser_idx:
-        # No swish after "But first," — it leads directly into story 1
-        pass
-    else:
-        teaser_sequence.append(intro_swish_path)
+                for i, tp in enumerate(teaser_paths):
+                    teaser_sequence.append(tp)
+                    if i == last_teaser_idx:
+                        # No swish after "But first," — leads directly into story 1
+                        pass
+                    else:
+                        teaser_sequence.append(intro_swish_path)
             else:
                 teaser_sequence = list(teaser_paths)
 
@@ -418,8 +420,6 @@ for i, tp in enumerate(teaser_paths):
                     print(f"Teaser music mixing failed, using dry teaser: {e}")
 
         # ── BUILD CLOSING SEGMENT WITH BEAT AND TAIL ─────────────────────────
-        # Voice plays, beat continues for 0.5s after voice ends, then fades out
-        # Volume lowered to 0.10 to sit further under the voice
         final_closing_path = closing_path
         if closing_path and closing_beat_url:
             try:
@@ -440,7 +440,6 @@ for i, tp in enumerate(teaser_paths):
                 print(f"Closing beat mixing failed, using dry closing: {e}")
 
         # ── BUILD MAIN STORIES BLOCK ──────────────────────────────────────────
-        # Fade out last story segment over 1.5s before throw sting fires
         if real_story_paths:
             last_story_path = real_story_paths[-1]
             faded_last_story_path = os.path.join(tmpdir, "last_story_faded.mp3")
@@ -475,7 +474,6 @@ for i, tp in enumerate(teaser_paths):
                     print(f"Beat mixing failed, continuing without beat: {e}")
 
         # ── ASSEMBLE FINAL EPISODE ────────────────────────────────────────────
-        # [intro] [teaser+music] [stories+beat] [throw] [closing+beat+tail] [outro]
         final_sequence = [intro_path]
         if final_teaser_path:
             final_sequence.append(final_teaser_path)
