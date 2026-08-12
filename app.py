@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 import random
 import requests
@@ -135,10 +136,29 @@ def mix_beat_under_audio(voice_path, beat_path, output_path, volume="0.15"):
     ]
     run_ffmpeg(cmd, "FFmpeg beat-mix error")
 
-def mix_beat_under_audio_with_tail(voice_path, beat_path, output_path, volume="0.15", tail_seconds=0.5, fade_duration=0.5):
-    """Mix beat under voice, extend beat by tail_seconds past voice end, then fade out."""
+def mix_beat_under_audio_with_tail(voice_path, beat_path, output_path, volume="0.15", tail_seconds=0.5, fade_duration=0.5, safety_buffer=0.15):
+    """Mix beat under voice, extend beat by tail_seconds past voice end, then fade out.
+
+    FIX (pun-tail truncation bug): this used to compute fade_start and the
+    hard -t output cap directly from get_audio_duration(voice_path). That
+    duration used to come from ffprobe's container-level metadata, which is
+    unreliable on the headerless VBR MP3s ElevenLabs streams back — it tends
+    to read the file as slightly SHORTER than the actual decoded audio. That
+    meant the fade-out could start (and the -t cap could cut) before the
+    voice had actually finished speaking, silently swallowing the last word
+    or two of a segment. This was the real cause of the "...sorry" missing
+    "about that one" bug — the text and TTS were always fine, the render was
+    trimming the tail early.
+
+    Two changes fix this:
+    1. get_audio_duration() below now decodes the file (ffmpeg -f null -)
+       instead of trusting container metadata, which is accurate regardless
+       of missing VBR headers.
+    2. A small safety_buffer is added on top of that, so even a residual
+       few-hundred-ms measurement error can't clip real speech.
+    """
     voice_duration = get_audio_duration(voice_path)
-    total_duration = voice_duration + tail_seconds
+    total_duration = voice_duration + tail_seconds + safety_buffer
     fade_start = total_duration - fade_duration
 
     cmd = [
@@ -148,7 +168,7 @@ def mix_beat_under_audio_with_tail(voice_path, beat_path, output_path, volume="0
         "-i", beat_path,
         "-filter_complex",
         (
-            f"[0:a]apad=pad_dur={tail_seconds}[voice_padded];"
+            f"[0:a]apad=pad_dur={tail_seconds + safety_buffer}[voice_padded];"
             f"[1:a]volume={volume}[beat_vol];"
             f"[voice_padded][beat_vol]amix=inputs=2:duration=first:dropout_transition=0[mixed];"
             f"[mixed]afade=t=out:st={fade_start:.3f}:d={fade_duration:.3f}[out]"
@@ -177,6 +197,28 @@ def apply_fade_out(input_path, output_path, fade_duration=1.5):
     run_ffmpeg(cmd, "FFmpeg fade-out error")
 
 def get_audio_duration(audio_path):
+    """Get accurate audio duration by decoding the whole file, rather than
+    trusting container-level metadata (ffprobe's format=duration).
+
+    WHY: MP3 files without a proper Xing/VBRI header — which describes
+    ElevenLabs' streamed TTS output — cause ffprobe to estimate duration
+    from bitrate math instead of reading real frame data, and that estimate
+    is often a bit SHORT of the true length. Anything downstream that trims
+    or fades based on that number (see mix_beat_under_audio_with_tail above)
+    ends up cutting into real audio. Decoding the file with `ffmpeg -f null -`
+    and reading the final `time=` progress line reflects the actual decoded
+    duration and is reliable regardless of missing headers.
+    """
+    cmd = ["ffmpeg", "-i", audio_path, "-f", "null", "-"]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    matches = re.findall(r"time=(\d+):(\d+):(\d+\.\d+)", result.stderr)
+    if matches:
+        h, m, s = matches[-1]
+        return int(h) * 3600 + int(m) * 60 + float(s)
+    # Fall back to container metadata only if decode-based parsing fails
+    return _get_audio_duration_ffprobe(audio_path)
+
+def _get_audio_duration_ffprobe(audio_path):
     cmd = [
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
