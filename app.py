@@ -24,6 +24,11 @@ BACKGROUND_VIDEO_URL = os.environ.get("BACKGROUND_VIDEO_URL", "")
 BACKGROUND_IMAGE_URL = os.environ.get("BACKGROUND_IMAGE_URL", "")
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
 
+# MUSIC_URLS: comma-separated pool of background-music tracks for
+# /make-video, one is picked at random per render (same pattern as
+# SWISH_URLS/THROW_URLS below). Falls back to TEASER_MUSIC_URL if empty.
+MUSIC_URLS = os.environ.get("MUSIC_URLS", "")
+
 FFMPEG_TIMEOUT_SECONDS = 240
 
 def download_file(url, dest_path, headers=None):
@@ -31,6 +36,15 @@ def download_file(url, dest_path, headers=None):
     r.raise_for_status()
     with open(dest_path, "wb") as f:
         f.write(r.content)
+
+def select_music_url():
+    """Pick a random track from MUSIC_URLS (comma-separated pool), falling
+    back to TEASER_MUSIC_URL if no pool is configured. Same pattern as the
+    SWISH_URLS/THROW_URLS pool selection used elsewhere in this file."""
+    pool = [u.strip() for u in MUSIC_URLS.split(',') if u.strip()]
+    if pool:
+        return random.choice(pool)
+    return TEASER_MUSIC_URL or None
 
 # NOTE: download_pexels_image() removed 2026-08-25. It attached a Pexels
 # Authorization header to every image download, but image_urls now come
@@ -634,6 +648,19 @@ def make_video():
         print(f"Downloading audio from: {audio_url}")
         download_file(audio_url, audio_path)
         print(f"Audio downloaded successfully")
+
+        music_url = data.get("music_url") or select_music_url()
+        if music_url:
+            try:
+                print(f"Mixing background music: {music_url}")
+                music_path = os.path.join(tmpdir, "music.mp3")
+                download_file(music_url, music_path)
+                mixed_audio_path = os.path.join(tmpdir, "audio_mixed.mp3")
+                mix_beat_under_audio(audio_path, music_path, mixed_audio_path, volume="0.12")
+                audio_path = mixed_audio_path
+                print("Background music mixed successfully")
+            except Exception as e:
+                print(f"Music mixing failed, continuing without music: {e}")
 
         video_succeeded = False
 
