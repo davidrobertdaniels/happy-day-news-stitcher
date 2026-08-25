@@ -386,6 +386,101 @@ def build_video_from_multi_image_bg(image_paths, audio_path, output_path):
         if silent_video_path and os.path.exists(silent_video_path):
             os.unlink(silent_video_path)
 
+def build_video_from_segments(segments, output_path, music_url=None):
+    """Build a video where each image is shown for exactly the duration of
+    its OWN corresponding audio segment, rather than splitting total audio
+    duration evenly across images. This is what makes image changes land
+    exactly on topic/headline changes instead of an approximate even split.
+
+    `segments` is a list of {"audio_path": ..., "image_path": ...} dicts,
+    already downloaded to disk, in the order they should play. Each
+    segment's real duration is measured directly (get_audio_duration) —
+    no assumption of equal length between segments.
+
+    Reuses the same building blocks as build_video_from_multi_image_bg
+    (one-image-at-a-time rendering + lightweight concat demuxer) to avoid
+    the memory-heavy xfade crossfade pattern that caused the 2026-08-25
+    Render OOM crash.
+    """
+    if not segments:
+        raise RuntimeError("At least one segment is required")
+
+    tmpdir = os.path.dirname(output_path)
+
+    # 1. Concatenate all segment audio into one narration track. Raw concat
+    #    (no per-clip normalisation) then normalise as one unit, same
+    #    reasoning as stitch_audio_raw's docstring: prevents volume jumps
+    #    between segments of different length/loudness.
+    audio_paths = [s["audio_path"] for s in segments]
+    raw_narration_path = os.path.join(tmpdir, f"narration_raw_{uuid.uuid4().hex[:6]}.mp3")
+    stitch_audio_raw(audio_paths, raw_narration_path)
+
+    narration_path = os.path.join(tmpdir, f"narration_norm_{uuid.uuid4().hex[:6]}.mp3")
+    normalise_audio(raw_narration_path, narration_path)
+
+    final_audio_path = narration_path
+    if music_url:
+        try:
+            music_path = os.path.join(tmpdir, f"seg_music_{uuid.uuid4().hex[:6]}.mp3")
+            download_file(music_url, music_path)
+            mixed_path = os.path.join(tmpdir, f"narration_mixed_{uuid.uuid4().hex[:6]}.mp3")
+            mix_beat_under_audio(narration_path, music_path, mixed_path, volume="0.12")
+            final_audio_path = mixed_path
+        except Exception as e:
+            print(f"Music mixing failed, continuing without music: {e}")
+
+    # 2. Build one silent video segment per image, each timed to its own
+    #    audio segment's REAL measured duration.
+    segment_video_paths = []
+    concat_list_path = None
+    silent_video_path = None
+    try:
+        for i, seg in enumerate(segments):
+            seg_duration = get_audio_duration(seg["audio_path"])
+            seg_video_path = os.path.join(tmpdir, f"segvid_{i}_{uuid.uuid4().hex[:6]}.mp4")
+            build_single_image_segment(seg["image_path"], seg_duration, seg_video_path)
+            segment_video_paths.append(seg_video_path)
+
+        concat_list_path = os.path.join(tmpdir, f"segconcat_{uuid.uuid4().hex[:6]}.txt")
+        with open(concat_list_path, "w") as f:
+            for p in segment_video_paths:
+                f.write(f"file '{p}'\n")
+
+        silent_video_path = os.path.join(tmpdir, f"segsilent_{uuid.uuid4().hex[:6]}.mp4")
+        concat_cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", concat_list_path,
+            "-c", "copy",
+            silent_video_path
+        ]
+        run_ffmpeg(concat_cmd, "FFmpeg segment concat error")
+
+        mux_cmd = [
+            "ffmpeg", "-y",
+            "-i", silent_video_path,
+            "-i", final_audio_path,
+            "-map", "0:v",
+            "-map", "1:a",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-shortest",
+            "-movflags", "+faststart",
+            output_path
+        ]
+        run_ffmpeg(mux_cmd, "FFmpeg audio-mux error")
+
+    finally:
+        for p in segment_video_paths:
+            if os.path.exists(p):
+                os.unlink(p)
+        if concat_list_path and os.path.exists(concat_list_path):
+            os.unlink(concat_list_path)
+        if silent_video_path and os.path.exists(silent_video_path):
+            os.unlink(silent_video_path)
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
@@ -620,6 +715,49 @@ def make_video():
             "raw_body": raw_body[:200]
         }), 400
 
+    # ── SEGMENTS MODE (exact per-headline image/audio sync) ──────────────
+    # Added 2026-08-25. If the request includes "segments" (a list of
+    # {"audio_url": ..., "image_url": ...} pairs, one per headline, in
+    # order), each image is shown for exactly the duration of its own
+    # audio clip rather than an even time-split across images -- image
+    # changes land exactly on topic changes. This is a separate path from
+    # the original audio_url + image_urls mode below, which is left
+    # unchanged for backward compatibility.
+    segments_data = data.get("segments")
+    if isinstance(segments_data, list) and len(segments_data) > 0:
+        job_id = str(uuid.uuid4())[:8]
+        tmpdir = tempfile.mkdtemp()
+        output_path = os.path.join(tmpdir, f"episode_video_{job_id}.mp4")
+        try:
+            downloaded_segments = []
+            for i, seg in enumerate(segments_data):
+                seg_audio_url = seg.get("audio_url")
+                seg_image_url = seg.get("image_url")
+                if not seg_audio_url or not seg_image_url:
+                    return jsonify({"error": f"segments[{i}] missing audio_url or image_url"}), 400
+                a_path = os.path.join(tmpdir, f"seg_audio_{i}.mp3")
+                i_path = os.path.join(tmpdir, f"seg_image_{i}.jpg")
+                print(f"Downloading segment {i}: audio + image")
+                download_file(seg_audio_url, a_path)
+                download_file(seg_image_url, i_path)
+                downloaded_segments.append({"audio_path": a_path, "image_path": i_path})
+
+            music_url = data.get("music_url") or select_music_url()
+            print(f"Building synced-segments video ({len(downloaded_segments)} segments)")
+            build_video_from_segments(downloaded_segments, output_path, music_url=music_url)
+            print("Synced-segments video built successfully")
+
+            return send_file(
+                output_path,
+                mimetype="video/mp4",
+                as_attachment=True,
+                download_name=f"happy_day_news_video_{job_id}.mp4"
+            )
+        except Exception as e:
+            print(f"make-video (segments mode) error: {e}")
+            return jsonify({"error": str(e)}), 500
+
+    # ── ORIGINAL MODE (single audio_url + image_urls, even time-split) ───
     audio_url = data.get("audio_url")
     if not audio_url:
         return jsonify({"error": "Missing 'audio_url' in JSON"}), 400
