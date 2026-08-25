@@ -32,9 +32,12 @@ def download_file(url, dest_path, headers=None):
     with open(dest_path, "wb") as f:
         f.write(r.content)
 
-def download_pexels_image(url, dest_path):
-    headers = {"Authorization": PEXELS_API_KEY} if PEXELS_API_KEY else {}
-    download_file(url, dest_path, headers=headers)
+# NOTE: download_pexels_image() removed 2026-08-25. It attached a Pexels
+# Authorization header to every image download, but image_urls now come
+# from Google Drive share links (AI-generated illustrations), not Pexels
+# -- that header was stale/wrong dead code left over from before the
+# Pexels-to-AI-image-generation swap. All image downloads now just use
+# download_file() directly, headerless.
 
 def run_ffmpeg(cmd, error_label):
     try:
@@ -271,62 +274,103 @@ def build_video_from_image_bg(image_path, audio_path, output_path):
     ]
     run_ffmpeg(cmd, "FFmpeg image-bg error")
 
-def build_video_from_multi_image_bg(image_paths, audio_path, output_path, transition_duration=0.75):
+def build_single_image_segment(image_path, duration, output_path):
+    """Render one image as a short silent video segment of the given
+    duration. Processes ONE image at a time so peak memory only ever
+    holds a single decoded image stream — see build_video_from_multi_image_bg
+    below for why this matters."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-loop", "1",
+        "-t", f"{duration:.3f}",
+        "-i", image_path,
+        "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30",
+        "-c:v", "libx264",
+        "-tune", "stillimage",
+        "-preset", "ultrafast",
+        "-crf", "28",
+        "-pix_fmt", "yuv420p",
+        output_path
+    ]
+    run_ffmpeg(cmd, "FFmpeg single-image segment error")
+
+def build_video_from_multi_image_bg(image_paths, audio_path, output_path):
+    """Build a slideshow video from multiple images, hard-cutting between
+    them rather than crossfading.
+
+    FIX (Render OOM crash, 2026-08-25): the previous version used ffmpeg's
+    xfade filter to crossfade between images, which requires decoding and
+    holding multiple full-resolution 1080x1920 video streams in memory
+    simultaneously during the blend. On Render's free tier (512MB RAM)
+    this reliably killed the worker mid-request — confirmed via repeated
+    ungraceful worker restarts in Render's logs, and NOT fixed by smaller
+    source images, since every image gets scaled up to 1080x1920 before
+    the crossfade regardless of its original size. Source resolution was
+    never the actual bottleneck; the simultaneous multi-stream blend was.
+
+    This version renders each image as its own small silent video segment
+    ONE AT A TIME (build_single_image_segment), so peak memory only ever
+    holds a single image stream, then concatenates the segments with
+    ffmpeg's lightweight concat demuxer (a cheap container-level join, no
+    re-encoding) before muxing in the audio track. Trade-off: hard cuts
+    between images instead of smooth crossfades.
+    """
     n = len(image_paths)
     if n < 1:
         raise RuntimeError("At least one image is required for a slideshow")
-    if n == 1:
-        build_video_from_image_bg(image_paths[0], audio_path, output_path)
-        return
 
+    tmpdir = os.path.dirname(output_path)
     total_duration = get_audio_duration(audio_path)
-    per_image_share = total_duration / n
-    segment_duration = per_image_share + transition_duration
+    per_image_duration = total_duration / n
 
-    inputs = []
-    for p in image_paths:
-        inputs += ["-loop", "1", "-t", f"{segment_duration:.3f}", "-i", p]
+    segment_paths = []
+    concat_list_path = None
+    silent_video_path = None
+    try:
+        for i, img_path in enumerate(image_paths):
+            seg_path = os.path.join(tmpdir, f"seg_{i}_{uuid.uuid4().hex[:6]}.mp4")
+            build_single_image_segment(img_path, per_image_duration, seg_path)
+            segment_paths.append(seg_path)
 
-    filter_parts = []
-    for i in range(n):
-        filter_parts.append(
-            f"[{i}:v]scale=1080:1920:force_original_aspect_ratio=increase,"
-            f"crop=1080:1920,setsar=1,fps=30[v{i}]"
-        )
+        concat_list_path = os.path.join(tmpdir, f"concat_{uuid.uuid4().hex[:6]}.txt")
+        with open(concat_list_path, "w") as f:
+            for p in segment_paths:
+                f.write(f"file '{p}'\n")
 
-    current_label = "v0"
-    cumulative_offset = per_image_share - transition_duration
-    if cumulative_offset < 0:
-        cumulative_offset = 0
-    for i in range(1, n):
-        next_label = f"x{i}" if i < n - 1 else "vout"
-        filter_parts.append(
-            f"[{current_label}][v{i}]xfade=transition=fade:"
-            f"duration={transition_duration:.3f}:offset={cumulative_offset:.3f}[{next_label}]"
-        )
-        current_label = next_label
-        cumulative_offset += per_image_share - transition_duration
+        silent_video_path = os.path.join(tmpdir, f"silent_{uuid.uuid4().hex[:6]}.mp4")
+        concat_cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", concat_list_path,
+            "-c", "copy",
+            silent_video_path
+        ]
+        run_ffmpeg(concat_cmd, "FFmpeg segment concat error")
 
-    filter_complex = ";".join(filter_parts)
+        mux_cmd = [
+            "ffmpeg", "-y",
+            "-i", silent_video_path,
+            "-i", audio_path,
+            "-map", "0:v",
+            "-map", "1:a",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-shortest",
+            "-movflags", "+faststart",
+            output_path
+        ]
+        run_ffmpeg(mux_cmd, "FFmpeg audio-mux error")
 
-    cmd = [
-        "ffmpeg", "-y",
-        *inputs,
-        "-i", audio_path,
-        "-filter_complex", filter_complex,
-        "-map", f"[{current_label}]",
-        "-map", f"{n}:a",
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "28",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        "-pix_fmt", "yuv420p",
-        "-t", f"{total_duration:.3f}",
-        "-movflags", "+faststart",
-        output_path
-    ]
-    run_ffmpeg(cmd, "FFmpeg multi-image slideshow error")
+    finally:
+        for p in segment_paths:
+            if os.path.exists(p):
+                os.unlink(p)
+        if concat_list_path and os.path.exists(concat_list_path):
+            os.unlink(concat_list_path)
+        if silent_video_path and os.path.exists(silent_video_path):
+            os.unlink(silent_video_path)
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -607,11 +651,11 @@ def make_video():
 
         if not video_succeeded:
             if has_explicit_image_urls:
-                print(f"Downloading {len(image_urls)} Pexels images")
+                print(f"Downloading {len(image_urls)} images")
                 image_paths = []
                 for i, url in enumerate(image_urls):
                     img_path = os.path.join(tmpdir, f"slide_{i}.jpg")
-                    download_pexels_image(url, img_path)
+                    download_file(url, img_path)
                     print(f"Image {i+1} downloaded")
                     image_paths.append(img_path)
                 print(f"Building multi-image slideshow")
