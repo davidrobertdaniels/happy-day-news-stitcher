@@ -548,17 +548,14 @@ def build_video_with_bumpers(image_paths, audio_path, output_path, bumper_video_
     per-segment), so the visual cuts between bumper/slideshow/bumper have
     no effect on it.
 
-    NOTE ON MUSIC: if the caller wants background music mixed in, that
-    should already be mixed into `audio_path` BEFORE calling this function
-    (as the /make-video route already does upstream) -- this function only
-    pads the START of whatever audio_path it's given; it deliberately does
-    not handle music mixing itself, to avoid mixing music twice. One
-    consequence: any pre-mixed music is delayed by audio_start_offset
-    along with the narration, rather than starting immediately at t=0
-    under the head bumper. That's a reasonable default (matches "the
-    audio starts audio_start_offset in") but flag it if independent
-    timing for music vs. narration is ever needed -- that would require
-    mixing music in AFTER padding here instead of before, in the route.
+    NOTE ON MUSIC (fixed 2026-08-26): music_url is optional. If provided,
+    it's downloaded and mixed under the padded narration track (opener +
+    teases + outro + leading silence) as one continuous bed, right after
+    padding -- so the music plays under the bumper's silent lead-in too,
+    starting from t=0. (Earlier version of this function silently dropped
+    music entirely -- the route never called select_music_url() for this
+    mode, so social_sync videos always rendered with no background music.
+    This was a real gap, not a deliberate design choice; fixed here.)
 
     Requires the padded audio to be at least 2 * bumper_duration seconds,
     i.e. long enough that the head and tail bumpers don't overlap --
@@ -656,7 +653,8 @@ def build_video_with_bumpers(image_paths, audio_path, output_path, bumper_video_
             os.unlink(silent_video_path)
 
 def build_synced_bumper_video(opener_audio_path, outro_audio_path, tease_segments,
-                               output_path, bumper_video_path, audio_start_offset=0.5):
+                               output_path, bumper_video_path, audio_start_offset=0.5,
+                               music_url=None):
     """Build a video where the head/tail bumper and each story image are
     each sized to their OWN real spoken audio duration, so visual cuts land
     exactly on story changes rather than an arbitrary fixed split.
@@ -731,6 +729,18 @@ def build_synced_bumper_video(opener_audio_path, outro_audio_path, tease_segment
     padded_narration_path = os.path.join(tmpdir, f"social_padded_{uuid.uuid4().hex[:6]}.mp3")
     pad_audio_start(norm_narration_path, padded_narration_path, delay_seconds=audio_start_offset)
 
+    final_audio_path = padded_narration_path
+    if music_url:
+        try:
+            music_path = os.path.join(tmpdir, f"social_music_{uuid.uuid4().hex[:6]}.mp3")
+            download_file(music_url, music_path)
+            mixed_path = os.path.join(tmpdir, f"social_padded_mixed_{uuid.uuid4().hex[:6]}.mp3")
+            mix_beat_under_audio(padded_narration_path, music_path, mixed_path, volume="0.12")
+            final_audio_path = mixed_path
+            print("Social video background music mixed successfully")
+        except Exception as e:
+            print(f"Social video music mixing failed, continuing without music: {e}")
+
     # 2. Build video segments in the same order, each sized to its own real
     #    audio duration computed above.
     segment_paths = []
@@ -771,7 +781,7 @@ def build_synced_bumper_video(opener_audio_path, outro_audio_path, tease_segment
         mux_cmd = [
             "ffmpeg", "-y",
             "-i", silent_video_path,
-            "-i", padded_narration_path,
+            "-i", final_audio_path,
             "-map", "0:v",
             "-map", "1:a",
             "-c:v", "copy",
@@ -1181,11 +1191,13 @@ def make_video():
                     "caption": seg.get("caption")
                 })
 
+            music_url = social_sync.get("music_url") or select_music_url()
             print("Building synced social video with head/tail bumper")
             build_synced_bumper_video(
                 opener_path, outro_path, downloaded_tease_segments,
                 output_path, bumper_path,
-                audio_start_offset=audio_start_offset
+                audio_start_offset=audio_start_offset,
+                music_url=music_url
             )
             print("Synced social video built successfully")
 
