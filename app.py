@@ -109,8 +109,13 @@ def _write_caption_textfile(caption, tmpdir):
     return path
 
 def _drawtext_filter(caption_textfile_path):
-    """Build the ffmpeg drawtext filter fragment for a bottom-third caption:
+    """Build the ffmpeg drawtext filter fragment for a near-top caption:
     white bold text on a semi-transparent black box, centered horizontally.
+    Positioned just below the top edge (y=160) rather than the bottom
+    third (changed 2026-08-26, per feedback) -- 160px gives a small safe
+    margin from the very top edge (where platform UI like a profile pic
+    or follow button often sits) while still reading clearly as "near the
+    top" rather than centered or bottom-anchored.
     Both the font path and the textfile path are escaped for use INSIDE an
     ffmpeg filter-graph string -- colons and backslashes are filter-graph
     syntax there, separate from any escaping the file contents themselves
@@ -123,7 +128,7 @@ def _drawtext_filter(caption_textfile_path):
         f"drawtext=fontfile='{escaped_font}':textfile='{escaped_path}':"
         f"fontsize={CAPTION_FONT_SIZE}:fontcolor=white:"
         f"box=1:boxcolor=black@0.55:boxborderw=20:"
-        f"x=(w-text_w)/2:y=h-380:line_spacing=12"
+        f"x=(w-text_w)/2:y=160:line_spacing=12"
     )
 
 def run_ffmpeg(cmd, error_label):
