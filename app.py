@@ -655,6 +655,143 @@ def build_video_with_bumpers(image_paths, audio_path, output_path, bumper_video_
         if silent_video_path and os.path.exists(silent_video_path):
             os.unlink(silent_video_path)
 
+def build_synced_bumper_video(opener_audio_path, outro_audio_path, tease_segments,
+                               output_path, bumper_video_path, audio_start_offset=0.5):
+    """Build a video where the head/tail bumper and each story image are
+    each sized to their OWN real spoken audio duration, so visual cuts land
+    exactly on story changes rather than an arbitrary fixed split.
+
+    Added 2026-08-26 (v2 of the bumper feature, replacing the fixed-duration
+    version): the original build_video_with_bumpers() used a fixed
+    bumper_duration for head/tail and split the middle evenly across
+    images, because at the time the whole social script (opener + all
+    teases + outro) was a single combined TTS clip with no way to know
+    where one line ended and the next began. Once each line has its own
+    TTS clip, the visual can be driven by real per-line durations instead.
+
+    Args:
+      opener_audio_path: path to the opener line's own audio clip
+      outro_audio_path: path to the outro line's own audio clip
+      tease_segments: list of {"audio_path": ..., "image_path": ...,
+        optionally "caption": ...} dicts, one per story, in order
+      bumper_video_path: the head/tail bumper video (looped/trimmed as
+        needed to fill whatever duration it's asked to cover)
+      audio_start_offset: seconds of silence before the opener begins
+        (default 0.5)
+
+    Timeline (all exact, no flooring/padding beyond audio_start_offset):
+      [0 .. audio_start_offset + opener_duration]          bumper (head)
+      [.. + tease_1_duration]                              image 1
+      [.. + tease_2_duration]                               image 2
+      ...
+      [.. + outro_duration]                                bumper (tail)
+
+    The narration audio is ONE continuous track -- opener, all teases, and
+    outro concatenated and normalised as a single unit, then padded with
+    audio_start_offset seconds of leading silence -- muxed over the whole
+    video. It never stops, resets, or restarts between visual segments.
+    Because the video timeline's segment lengths are built directly from
+    this same audio's real per-clip durations, total video length and
+    total audio length always match exactly by construction -- no
+    -shortest reconciliation or drift is needed.
+
+    Reuses the same one-clip-at-a-time + concat demuxer pattern as the
+    other build_video_from_* functions, to avoid the memory-heavy
+    simultaneous-stream approach that caused the 2026-08-25 Render OOM
+    crash.
+    """
+    n = len(tease_segments)
+    if n < 1:
+        raise RuntimeError("At least one tease segment is required")
+    for i, seg in enumerate(tease_segments):
+        if "audio_path" not in seg or "image_path" not in seg:
+            raise RuntimeError(f"tease_segments[{i}] missing audio_path or image_path")
+
+    tmpdir = os.path.dirname(output_path)
+
+    opener_dur = get_audio_duration(opener_audio_path)
+    outro_dur = get_audio_duration(outro_audio_path)
+    tease_durs = [get_audio_duration(seg["audio_path"]) for seg in tease_segments]
+
+    head_bumper_duration = audio_start_offset + opener_dur
+    tail_bumper_duration = outro_dur
+
+    # 1. Build the single continuous narration track: opener + all teases +
+    #    outro, raw concat (no per-clip normalisation) then normalised as
+    #    one unit -- same reasoning as stitch_audio_raw's docstring:
+    #    prevents volume jumps between clips of different length/loudness
+    #    -- then padded with silence at the very front.
+    all_audio_paths = [opener_audio_path] + [seg["audio_path"] for seg in tease_segments] + [outro_audio_path]
+    raw_narration_path = os.path.join(tmpdir, f"social_raw_{uuid.uuid4().hex[:6]}.mp3")
+    stitch_audio_raw(all_audio_paths, raw_narration_path)
+
+    norm_narration_path = os.path.join(tmpdir, f"social_norm_{uuid.uuid4().hex[:6]}.mp3")
+    normalise_audio(raw_narration_path, norm_narration_path)
+
+    padded_narration_path = os.path.join(tmpdir, f"social_padded_{uuid.uuid4().hex[:6]}.mp3")
+    pad_audio_start(norm_narration_path, padded_narration_path, delay_seconds=audio_start_offset)
+
+    # 2. Build video segments in the same order, each sized to its own real
+    #    audio duration computed above.
+    segment_paths = []
+    concat_list_path = None
+    silent_video_path = None
+    try:
+        head_path = os.path.join(tmpdir, f"bumper_head_{uuid.uuid4().hex[:6]}.mp4")
+        build_bumper_segment(bumper_video_path, head_bumper_duration, head_path)
+        segment_paths.append(head_path)
+
+        for i, seg in enumerate(tease_segments):
+            seg_path = os.path.join(tmpdir, f"tease_{i}_{uuid.uuid4().hex[:6]}.mp4")
+            build_single_image_segment(
+                seg["image_path"], tease_durs[i], seg_path, caption=seg.get("caption")
+            )
+            segment_paths.append(seg_path)
+
+        tail_path = os.path.join(tmpdir, f"bumper_tail_{uuid.uuid4().hex[:6]}.mp4")
+        build_bumper_segment(bumper_video_path, tail_bumper_duration, tail_path)
+        segment_paths.append(tail_path)
+
+        concat_list_path = os.path.join(tmpdir, f"concat_{uuid.uuid4().hex[:6]}.txt")
+        with open(concat_list_path, "w") as f:
+            for p in segment_paths:
+                f.write(f"file '{p}'\n")
+
+        silent_video_path = os.path.join(tmpdir, f"silent_{uuid.uuid4().hex[:6]}.mp4")
+        concat_cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", concat_list_path,
+            "-c", "copy",
+            silent_video_path
+        ]
+        run_ffmpeg(concat_cmd, "FFmpeg segment concat error")
+
+        mux_cmd = [
+            "ffmpeg", "-y",
+            "-i", silent_video_path,
+            "-i", padded_narration_path,
+            "-map", "0:v",
+            "-map", "1:a",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-shortest",
+            "-movflags", "+faststart",
+            output_path
+        ]
+        run_ffmpeg(mux_cmd, "FFmpeg audio-mux error")
+
+    finally:
+        for p in segment_paths:
+            if os.path.exists(p):
+                os.unlink(p)
+        if concat_list_path and os.path.exists(concat_list_path):
+            os.unlink(concat_list_path)
+        if silent_video_path and os.path.exists(silent_video_path):
+            os.unlink(silent_video_path)
+
 def build_video_from_segments(segments, output_path, music_url=None):
     """Build a video where each image is shown for exactly the duration of
     its OWN corresponding audio segment, rather than splitting total audio
@@ -987,6 +1124,80 @@ def make_video():
             "error": "Could not parse JSON body",
             "raw_body": raw_body[:200]
         }), 400
+
+    # ── SOCIAL SYNCED-BUMPER MODE (per-story visual sync + head/tail bumper) ──
+    # Added 2026-08-26. If the request includes "social_sync" (an object
+    # with opener_audio_url, outro_audio_url, tease_segments, and
+    # bumper_video_url), each story image is shown for exactly the
+    # duration of its own tease line's audio, and a bumper video plays at
+    # the head (sized to the opener line) and tail (sized to the outro
+    # line), all under one continuous narration track. See
+    # build_synced_bumper_video() for the full design notes. Checked first
+    # since it's the most specific request shape.
+    social_sync = data.get("social_sync")
+    if isinstance(social_sync, dict):
+        job_id = str(uuid.uuid4())[:8]
+        tmpdir = tempfile.mkdtemp()
+        output_path = os.path.join(tmpdir, f"episode_video_{job_id}.mp4")
+        try:
+            opener_audio_url = social_sync.get("opener_audio_url")
+            outro_audio_url = social_sync.get("outro_audio_url")
+            bumper_video_url = social_sync.get("bumper_video_url") or BUMPER_VIDEO_URL
+            tease_segments_data = social_sync.get("tease_segments")
+            audio_start_offset = float(social_sync.get("audio_start_offset", 0.5))
+
+            missing = [k for k, v in {
+                "opener_audio_url": opener_audio_url,
+                "outro_audio_url": outro_audio_url,
+                "bumper_video_url": bumper_video_url,
+            }.items() if not v]
+            if missing:
+                return jsonify({"error": f"social_sync missing required field(s): {', '.join(missing)}"}), 400
+            if not isinstance(tease_segments_data, list) or len(tease_segments_data) < 1:
+                return jsonify({"error": "social_sync.tease_segments must be a non-empty list"}), 400
+
+            print("Downloading social_sync assets: opener, outro, bumper, "
+                  f"{len(tease_segments_data)} tease segment(s)")
+            opener_path = os.path.join(tmpdir, "opener.mp3")
+            outro_path = os.path.join(tmpdir, "outro.mp3")
+            bumper_path = os.path.join(tmpdir, "bumper.mp4")
+            download_file(opener_audio_url, opener_path)
+            download_file(outro_audio_url, outro_path)
+            download_file(bumper_video_url, bumper_path)
+
+            downloaded_tease_segments = []
+            for i, seg in enumerate(tease_segments_data):
+                seg_audio_url = seg.get("audio_url")
+                seg_image_url = seg.get("image_url")
+                if not seg_audio_url or not seg_image_url:
+                    return jsonify({"error": f"social_sync.tease_segments[{i}] missing audio_url or image_url"}), 400
+                a_path = os.path.join(tmpdir, f"tease_audio_{i}.mp3")
+                i_path = os.path.join(tmpdir, f"tease_image_{i}.jpg")
+                download_file(seg_audio_url, a_path)
+                download_file(seg_image_url, i_path)
+                downloaded_tease_segments.append({
+                    "audio_path": a_path,
+                    "image_path": i_path,
+                    "caption": seg.get("caption")
+                })
+
+            print("Building synced social video with head/tail bumper")
+            build_synced_bumper_video(
+                opener_path, outro_path, downloaded_tease_segments,
+                output_path, bumper_path,
+                audio_start_offset=audio_start_offset
+            )
+            print("Synced social video built successfully")
+
+            return send_file(
+                output_path,
+                mimetype="video/mp4",
+                as_attachment=True,
+                download_name=f"happy_day_news_video_{job_id}.mp4"
+            )
+        except Exception as e:
+            print(f"make-video (social_sync mode) error: {e}")
+            return jsonify({"error": str(e)}), 500
 
     # ── SEGMENTS MODE (exact per-headline image/audio sync) ──────────────
     # Added 2026-08-25. If the request includes "segments" (a list of
