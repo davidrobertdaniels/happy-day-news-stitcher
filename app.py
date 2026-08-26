@@ -2,6 +2,7 @@ import os
 import re
 import uuid
 import random
+import textwrap
 import requests
 import subprocess
 import tempfile
@@ -29,7 +30,27 @@ PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
 # SWISH_URLS/THROW_URLS below). Falls back to TEASER_MUSIC_URL if empty.
 MUSIC_URLS = os.environ.get("MUSIC_URLS", "")
 
-FFMPEG_TIMEOUT_SECONDS = 240
+# ── CAPTION SUPPORT (added 2026-08-26) ──────────────────────────────────
+# /make-video can now optionally burn a short caption onto each image
+# segment (ffmpeg drawtext), so a social post's on-screen text matches
+# what the corresponding audio moment is about. Backward compatible: if
+# no "captions"/"caption" field is sent, behavior is identical to before
+# -- this is entirely opt-in per request.
+#
+# FONT_PATH defaults to a font file bundled in the repo at the same
+# level as this file (DejaVuSans-Bold.ttf), resolved relative to this
+# file's own location, not the working directory, so it works correctly
+# regardless of how Render invokes gunicorn. Render's plain Python
+# buildpack does not ship any system fonts, so this file must actually
+# exist in the repo for captions to work -- if it's missing, a caption
+# request fails with a clear error rather than crashing the whole render.
+FONT_PATH = os.environ.get(
+    "FONT_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "DejaVuSans-Bold.ttf")
+)
+CAPTION_MAX_CHARS_PER_LINE = 24
+CAPTION_MAX_LINES = 3
+CAPTION_FONT_SIZE = 64
 
 def download_file(url, dest_path, headers=None):
     r = requests.get(url, timeout=60, headers=headers or {})
@@ -53,6 +74,53 @@ def select_music_url():
 # Pexels-to-AI-image-generation swap. All image downloads now just use
 # download_file() directly, headerless.
 
+def _wrap_caption(text, max_chars=CAPTION_MAX_CHARS_PER_LINE, max_lines=CAPTION_MAX_LINES):
+    """Word-wrap caption text into a small number of short lines, since
+    ffmpeg's drawtext filter does not auto-wrap on its own. Truncates with
+    an ellipsis if the text would need more than max_lines, rather than
+    letting it overflow the frame."""
+    if not text or not text.strip():
+        return ""
+    wrapped = textwrap.wrap(text.strip(), width=max_chars)
+    if len(wrapped) > max_lines:
+        wrapped = wrapped[:max_lines]
+        last = wrapped[-1].rstrip()
+        if len(last) > 3:
+            last = last[:-3].rstrip() + "..."
+        wrapped[-1] = last
+    return "\n".join(wrapped)
+
+def _write_caption_textfile(caption, tmpdir):
+    """Write wrapped caption text to a temp file for ffmpeg's drawtext
+    textfile= option. Deliberately NOT using drawtext's inline text=
+    option -- real headlines routinely contain apostrophes, colons, and
+    quotes ("Skyroot Aerospace Launches India's First Private Rocket") that
+    are fragile and error-prone to escape correctly inside an ffmpeg
+    filter-graph string. A plain text file sidesteps that entirely."""
+    wrapped = _wrap_caption(caption)
+    path = os.path.join(tmpdir, f"caption_{uuid.uuid4().hex[:6]}.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(wrapped)
+    return path
+
+def _drawtext_filter(caption_textfile_path):
+    """Build the ffmpeg drawtext filter fragment for a bottom-third caption:
+    white bold text on a semi-transparent black box, centered horizontally.
+    Both the font path and the textfile path are escaped for use INSIDE an
+    ffmpeg filter-graph string -- colons and backslashes are filter-graph
+    syntax there, separate from any escaping the file contents themselves
+    might need (they need none, since textfile= reads plain text)."""
+    def escape_for_filter(p):
+        return p.replace("\\", "\\\\").replace(":", "\\:")
+    escaped_path = escape_for_filter(caption_textfile_path)
+    escaped_font = escape_for_filter(FONT_PATH)
+    return (
+        f"drawtext=fontfile='{escaped_font}':textfile='{escaped_path}':"
+        f"fontsize={CAPTION_FONT_SIZE}:fontcolor=white:"
+        f"box=1:boxcolor=black@0.55:boxborderw=20:"
+        f"x=(w-text_w)/2:y=h-380:line_spacing=12"
+    )
+
 def run_ffmpeg(cmd, error_label):
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_SECONDS)
@@ -61,6 +129,8 @@ def run_ffmpeg(cmd, error_label):
     if result.returncode != 0:
         raise RuntimeError(f"{error_label}: {result.stderr}")
     return result
+
+FFMPEG_TIMEOUT_SECONDS = 240
 
 def stitch_audio(file_paths, output_path):
     """Stitch with per-clip loudnorm — used for main story block."""
@@ -288,17 +358,35 @@ def build_video_from_image_bg(image_path, audio_path, output_path):
     ]
     run_ffmpeg(cmd, "FFmpeg image-bg error")
 
-def build_single_image_segment(image_path, duration, output_path):
+def build_single_image_segment(image_path, duration, output_path, caption=None):
     """Render one image as a short silent video segment of the given
     duration. Processes ONE image at a time so peak memory only ever
     holds a single decoded image stream — see build_video_from_multi_image_bg
-    below for why this matters."""
+    below for why this matters.
+
+    caption (added 2026-08-26): optional short text to burn onto this
+    segment via ffmpeg's drawtext filter (bottom-third, boxed). None by
+    default -- existing callers that don't pass it get identical output to
+    before this change."""
+    tmpdir = os.path.dirname(output_path)
+    vf_parts = ["scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30"]
+
+    if caption:
+        if not os.path.exists(FONT_PATH):
+            raise RuntimeError(
+                f"Caption requested but font file not found at {FONT_PATH}. "
+                f"Add a .ttf font to the repo (default expected path: "
+                f"DejaVuSans-Bold.ttf, next to app.py) or set the FONT_PATH env var."
+            )
+        caption_textfile = _write_caption_textfile(caption, tmpdir)
+        vf_parts.append(_drawtext_filter(caption_textfile))
+
     cmd = [
         "ffmpeg", "-y",
         "-loop", "1",
         "-t", f"{duration:.3f}",
         "-i", image_path,
-        "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30",
+        "-vf", ",".join(vf_parts),
         "-c:v", "libx264",
         "-tune", "stillimage",
         "-preset", "ultrafast",
@@ -308,7 +396,7 @@ def build_single_image_segment(image_path, duration, output_path):
     ]
     run_ffmpeg(cmd, "FFmpeg single-image segment error")
 
-def build_video_from_multi_image_bg(image_paths, audio_path, output_path):
+def build_video_from_multi_image_bg(image_paths, audio_path, output_path, captions=None):
     """Build a slideshow video from multiple images, hard-cutting between
     them rather than crossfading.
 
@@ -328,10 +416,19 @@ def build_video_from_multi_image_bg(image_paths, audio_path, output_path):
     ffmpeg's lightweight concat demuxer (a cheap container-level join, no
     re-encoding) before muxing in the audio track. Trade-off: hard cuts
     between images instead of smooth crossfades.
+
+    captions (added 2026-08-26): optional list of short caption strings,
+    same length and order as image_paths -- captions[i] is burned onto
+    image_paths[i]'s segment. None by default (identical to pre-caption
+    behavior).
     """
     n = len(image_paths)
     if n < 1:
         raise RuntimeError("At least one image is required for a slideshow")
+    if captions is not None and len(captions) != n:
+        raise RuntimeError(
+            f"captions list length ({len(captions)}) must match image_urls length ({n})"
+        )
 
     tmpdir = os.path.dirname(output_path)
     total_duration = get_audio_duration(audio_path)
@@ -343,7 +440,8 @@ def build_video_from_multi_image_bg(image_paths, audio_path, output_path):
     try:
         for i, img_path in enumerate(image_paths):
             seg_path = os.path.join(tmpdir, f"seg_{i}_{uuid.uuid4().hex[:6]}.mp4")
-            build_single_image_segment(img_path, per_image_duration, seg_path)
+            caption = captions[i] if captions else None
+            build_single_image_segment(img_path, per_image_duration, seg_path, caption=caption)
             segment_paths.append(seg_path)
 
         concat_list_path = os.path.join(tmpdir, f"concat_{uuid.uuid4().hex[:6]}.txt")
@@ -392,10 +490,12 @@ def build_video_from_segments(segments, output_path, music_url=None):
     duration evenly across images. This is what makes image changes land
     exactly on topic/headline changes instead of an approximate even split.
 
-    `segments` is a list of {"audio_path": ..., "image_path": ...} dicts,
-    already downloaded to disk, in the order they should play. Each
-    segment's real duration is measured directly (get_audio_duration) —
-    no assumption of equal length between segments.
+    `segments` is a list of {"audio_path": ..., "image_path": ..., optionally
+    "caption": ...} dicts, already downloaded to disk, in the order they
+    should play. Each segment's real duration is measured directly
+    (get_audio_duration) — no assumption of equal length between segments.
+    "caption" (added 2026-08-26) is optional per-segment; omitted/None
+    segments get no on-screen text, same as before this change.
 
     Reuses the same building blocks as build_video_from_multi_image_bg
     (one-image-at-a-time rendering + lightweight concat demuxer) to avoid
@@ -438,7 +538,9 @@ def build_video_from_segments(segments, output_path, music_url=None):
         for i, seg in enumerate(segments):
             seg_duration = get_audio_duration(seg["audio_path"])
             seg_video_path = os.path.join(tmpdir, f"segvid_{i}_{uuid.uuid4().hex[:6]}.mp4")
-            build_single_image_segment(seg["image_path"], seg_duration, seg_video_path)
+            build_single_image_segment(
+                seg["image_path"], seg_duration, seg_video_path, caption=seg.get("caption")
+            )
             segment_video_paths.append(seg_video_path)
 
         concat_list_path = os.path.join(tmpdir, f"segconcat_{uuid.uuid4().hex[:6]}.txt")
@@ -723,6 +825,9 @@ def make_video():
     # changes land exactly on topic changes. This is a separate path from
     # the original audio_url + image_urls mode below, which is left
     # unchanged for backward compatibility.
+    #
+    # Each segment dict may also include an optional "caption" (added
+    # 2026-08-26) -- a short line burned onto that segment's image.
     segments_data = data.get("segments")
     if isinstance(segments_data, list) and len(segments_data) > 0:
         job_id = str(uuid.uuid4())[:8]
@@ -740,7 +845,11 @@ def make_video():
                 print(f"Downloading segment {i}: audio + image")
                 download_file(seg_audio_url, a_path)
                 download_file(seg_image_url, i_path)
-                downloaded_segments.append({"audio_path": a_path, "image_path": i_path})
+                downloaded_segments.append({
+                    "audio_path": a_path,
+                    "image_path": i_path,
+                    "caption": seg.get("caption")
+                })
 
             music_url = data.get("music_url") or select_music_url()
             print(f"Building synced-segments video ({len(downloaded_segments)} segments)")
@@ -764,6 +873,20 @@ def make_video():
 
     image_urls = data.get("image_urls")
     has_explicit_image_urls = isinstance(image_urls, list) and len(image_urls) > 0
+
+    # captions (added 2026-08-26): optional list, same length/order as
+    # image_urls -- captions[i] is burned onto image_urls[i]'s segment.
+    # Only meaningful when has_explicit_image_urls is true (there's no
+    # per-image concept for a single video/image background).
+    captions = data.get("captions")
+    if captions is not None and not has_explicit_image_urls:
+        return jsonify({"error": "'captions' was provided but 'image_urls' was not"}), 400
+    if captions is not None and (not isinstance(captions, list) or len(captions) != len(image_urls)):
+        return jsonify({
+            "error": "'captions' must be a list the same length as 'image_urls'",
+            "image_urls_count": len(image_urls) if has_explicit_image_urls else 0,
+            "captions_count": len(captions) if isinstance(captions, list) else None
+        }), 400
 
     if has_explicit_image_urls:
         video_url = None
@@ -824,7 +947,7 @@ def make_video():
                     print(f"Image {i+1} downloaded")
                     image_paths.append(img_path)
                 print(f"Building multi-image slideshow")
-                build_video_from_multi_image_bg(image_paths, audio_path, output_path)
+                build_video_from_multi_image_bg(image_paths, audio_path, output_path, captions=captions)
                 print(f"Slideshow built successfully")
             elif image_url:
                 print(f"Downloading single background image")
