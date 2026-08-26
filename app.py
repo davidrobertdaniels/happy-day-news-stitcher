@@ -25,6 +25,11 @@ BACKGROUND_VIDEO_URL = os.environ.get("BACKGROUND_VIDEO_URL", "")
 BACKGROUND_IMAGE_URL = os.environ.get("BACKGROUND_IMAGE_URL", "")
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
 
+# BUMPER_VIDEO_URL (added 2026-08-26): optional short video clip played at
+# both the head and tail of a /make-video image-slideshow render, under
+# the narration. See build_video_with_bumpers() below.
+BUMPER_VIDEO_URL = os.environ.get("BUMPER_VIDEO_URL", "")
+
 # MUSIC_URLS: comma-separated pool of background-music tracks for
 # /make-video, one is picked at random per render (same pattern as
 # SWISH_URLS/THROW_URLS below). Falls back to TEASER_MUSIC_URL if empty.
@@ -283,6 +288,46 @@ def apply_fade_out(input_path, output_path, fade_duration=1.5):
     ]
     run_ffmpeg(cmd, "FFmpeg fade-out error")
 
+def pad_audio_start(input_path, output_path, delay_seconds=0.5):
+    """Insert delay_seconds of silence at the start of the audio, so
+    narration begins exactly delay_seconds into the file rather than at
+    t=0. Used by build_video_with_bumpers() (added 2026-08-26) so the
+    voice-over starts half a second after the video opens, giving the
+    head bumper clip a beat of visual breathing room before narration
+    kicks in."""
+    delay_ms = int(round(delay_seconds * 1000))
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-af", f"adelay={delay_ms}|{delay_ms}",
+        "-acodec", "libmp3lame",
+        "-q:a", "2",
+        output_path
+    ]
+    run_ffmpeg(cmd, "FFmpeg audio pad-start error")
+
+def build_bumper_segment(bumper_video_path, duration, output_path):
+    """Render bumper_video_path as a fixed-duration SILENT video segment
+    (no audio -- narration is muxed separately over the full timeline in
+    build_video_with_bumpers), looping if the source is shorter than
+    duration or trimming if longer. Same scale/crop/fps/codec settings as
+    build_single_image_segment so the concat demuxer below can safely
+    -c:v copy across bumper and slideshow segments without re-encoding."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-stream_loop", "-1",
+        "-i", bumper_video_path,
+        "-t", f"{duration:.3f}",
+        "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30",
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "28",
+        "-pix_fmt", "yuv420p",
+        output_path
+    ]
+    run_ffmpeg(cmd, "FFmpeg bumper segment error")
+
 def get_audio_duration(audio_path):
     """Get accurate audio duration by decoding the whole file, rather than
     trusting container-level metadata (ffprobe's format=duration).
@@ -464,6 +509,132 @@ def build_video_from_multi_image_bg(image_paths, audio_path, output_path, captio
             "ffmpeg", "-y",
             "-i", silent_video_path,
             "-i", audio_path,
+            "-map", "0:v",
+            "-map", "1:a",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-shortest",
+            "-movflags", "+faststart",
+            output_path
+        ]
+        run_ffmpeg(mux_cmd, "FFmpeg audio-mux error")
+
+    finally:
+        for p in segment_paths:
+            if os.path.exists(p):
+                os.unlink(p)
+        if concat_list_path and os.path.exists(concat_list_path):
+            os.unlink(concat_list_path)
+        if silent_video_path and os.path.exists(silent_video_path):
+            os.unlink(silent_video_path)
+
+def build_video_with_bumpers(image_paths, audio_path, output_path, bumper_video_path,
+                              bumper_duration=5.0, audio_start_offset=0.5, captions=None):
+    """Build a video with a fixed-duration bumper clip at the head AND
+    tail, an image slideshow in between, and narration audio that starts
+    audio_start_offset seconds in rather than at t=0.
+
+    Added 2026-08-26. Timeline:
+      [0 .. bumper_duration]                       bumper video (silent, visual only)
+      [bumper_duration .. total-bumper_duration]    image slideshow (captions optional)
+      [total-bumper_duration .. total]              bumper video again
+
+    `total` is the REAL decoded duration of the narration audio AFTER
+    padding it with audio_start_offset seconds of leading silence (via
+    pad_audio_start) -- so the final video is always exactly as long as
+    "silence + narration", with the bumpers and slideshow filling that
+    space. The padded audio track is muxed over the FULL timeline (not
+    per-segment), so the visual cuts between bumper/slideshow/bumper have
+    no effect on it.
+
+    NOTE ON MUSIC: if the caller wants background music mixed in, that
+    should already be mixed into `audio_path` BEFORE calling this function
+    (as the /make-video route already does upstream) -- this function only
+    pads the START of whatever audio_path it's given; it deliberately does
+    not handle music mixing itself, to avoid mixing music twice. One
+    consequence: any pre-mixed music is delayed by audio_start_offset
+    along with the narration, rather than starting immediately at t=0
+    under the head bumper. That's a reasonable default (matches "the
+    audio starts audio_start_offset in") but flag it if independent
+    timing for music vs. narration is ever needed -- that would require
+    mixing music in AFTER padding here instead of before, in the route.
+
+    Requires the padded audio to be at least 2 * bumper_duration seconds,
+    i.e. long enough that the head and tail bumpers don't overlap --
+    raises a clear RuntimeError rather than producing a mangled video if
+    the narration is too short for the configured bumper_duration.
+
+    Reuses the same one-clip-at-a-time + concat demuxer pattern as
+    build_video_from_multi_image_bg / build_video_from_segments, to avoid
+    the memory-heavy simultaneous-stream approach that caused the
+    2026-08-25 Render OOM crash.
+    """
+    n = len(image_paths)
+    if n < 1:
+        raise RuntimeError("At least one image is required for the slideshow portion")
+    if captions is not None and len(captions) != n:
+        raise RuntimeError(
+            f"captions list length ({len(captions)}) must match image_urls length ({n})"
+        )
+
+    tmpdir = os.path.dirname(output_path)
+
+    padded_audio_path = os.path.join(tmpdir, f"padded_audio_{uuid.uuid4().hex[:6]}.mp3")
+    pad_audio_start(audio_path, padded_audio_path, delay_seconds=audio_start_offset)
+
+    total_duration = get_audio_duration(padded_audio_path)
+    if total_duration < (2 * bumper_duration):
+        raise RuntimeError(
+            f"Narration audio ({total_duration:.2f}s including {audio_start_offset}s "
+            f"lead-in) is too short to fit a {bumper_duration}s bumper at both head "
+            f"and tail without overlapping. Need at least {2 * bumper_duration}s."
+        )
+
+    middle_duration = total_duration - (2 * bumper_duration)
+    per_image_duration = middle_duration / n
+
+    segment_paths = []
+    concat_list_path = None
+    silent_video_path = None
+    try:
+        head_path = os.path.join(tmpdir, f"bumper_head_{uuid.uuid4().hex[:6]}.mp4")
+        build_bumper_segment(bumper_video_path, bumper_duration, head_path)
+        segment_paths.append(head_path)
+
+        for i, img_path in enumerate(image_paths):
+            seg_path = os.path.join(tmpdir, f"seg_{i}_{uuid.uuid4().hex[:6]}.mp4")
+            caption = captions[i] if captions else None
+            build_single_image_segment(img_path, per_image_duration, seg_path, caption=caption)
+            segment_paths.append(seg_path)
+
+        # Rendered as a separate call (not the same file reused twice) so
+        # ffmpeg decodes the bumper source fresh for the tail rather than
+        # reusing a stream reference at two points in the concat list.
+        tail_path = os.path.join(tmpdir, f"bumper_tail_{uuid.uuid4().hex[:6]}.mp4")
+        build_bumper_segment(bumper_video_path, bumper_duration, tail_path)
+        segment_paths.append(tail_path)
+
+        concat_list_path = os.path.join(tmpdir, f"concat_{uuid.uuid4().hex[:6]}.txt")
+        with open(concat_list_path, "w") as f:
+            for p in segment_paths:
+                f.write(f"file '{p}'\n")
+
+        silent_video_path = os.path.join(tmpdir, f"silent_{uuid.uuid4().hex[:6]}.mp4")
+        concat_cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", concat_list_path,
+            "-c", "copy",
+            silent_video_path
+        ]
+        run_ffmpeg(concat_cmd, "FFmpeg segment concat error")
+
+        mux_cmd = [
+            "ffmpeg", "-y",
+            "-i", silent_video_path,
+            "-i", padded_audio_path,
             "-map", "0:v",
             "-map", "1:a",
             "-c:v", "copy",
@@ -937,8 +1108,34 @@ def make_video():
                 print(f"Video background failed, falling back to image: {e}")
                 used_fallback = True
 
+        # bumper_video_url (added 2026-08-26): optional head/tail bumper
+        # clip for the image-slideshow path. Entirely opt-in -- if neither
+        # the request nor the BUMPER_VIDEO_URL env var supplies one, this
+        # falls through to the original slideshow behavior unchanged.
+        bumper_video_url = data.get("bumper_video_url") or BUMPER_VIDEO_URL
+        bumper_duration = float(data.get("bumper_duration", 5.0))
+        audio_start_offset = float(data.get("audio_start_offset", 0.5))
+
         if not video_succeeded:
-            if has_explicit_image_urls:
+            if has_explicit_image_urls and bumper_video_url:
+                print(f"Downloading {len(image_urls)} images + bumper video")
+                image_paths = []
+                for i, url in enumerate(image_urls):
+                    img_path = os.path.join(tmpdir, f"slide_{i}.jpg")
+                    download_file(url, img_path)
+                    print(f"Image {i+1} downloaded")
+                    image_paths.append(img_path)
+                bumper_path = os.path.join(tmpdir, "bumper.mp4")
+                download_file(bumper_video_url, bumper_path)
+                print(f"Building video with {bumper_duration}s head/tail bumper")
+                build_video_with_bumpers(
+                    image_paths, audio_path, output_path, bumper_path,
+                    bumper_duration=bumper_duration,
+                    audio_start_offset=audio_start_offset,
+                    captions=captions
+                )
+                print(f"Bumper video built successfully")
+            elif has_explicit_image_urls:
                 print(f"Downloading {len(image_urls)} images")
                 image_paths = []
                 for i, url in enumerate(image_urls):
