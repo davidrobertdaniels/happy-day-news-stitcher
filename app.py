@@ -658,8 +658,8 @@ def build_video_with_bumpers(image_paths, audio_path, output_path, bumper_video_
             os.unlink(silent_video_path)
 
 def build_synced_bumper_video(opener_audio_path, outro_audio_path, tease_segments,
-                               output_path, bumper_video_path, audio_start_offset=0.5,
-                               music_url=None):
+                               output_path, intro_video_path, outro_video_path,
+                               audio_start_offset=0.5, music_url=None):
     """Build a video where the head/tail bumper and each story image are
     each sized to their OWN real spoken audio duration, so visual cuts land
     exactly on story changes rather than an arbitrary fixed split.
@@ -753,7 +753,7 @@ def build_synced_bumper_video(opener_audio_path, outro_audio_path, tease_segment
     silent_video_path = None
     try:
         head_path = os.path.join(tmpdir, f"bumper_head_{uuid.uuid4().hex[:6]}.mp4")
-        build_bumper_segment(bumper_video_path, head_bumper_duration, head_path)
+        build_bumper_segment(intro_video_path, head_bumper_duration, head_path)
         segment_paths.append(head_path)
 
         for i, seg in enumerate(tease_segments):
@@ -764,7 +764,7 @@ def build_synced_bumper_video(opener_audio_path, outro_audio_path, tease_segment
             segment_paths.append(seg_path)
 
         tail_path = os.path.join(tmpdir, f"bumper_tail_{uuid.uuid4().hex[:6]}.mp4")
-        build_bumper_segment(bumper_video_path, tail_bumper_duration, tail_path)
+        build_bumper_segment(outro_video_path, tail_bumper_duration, tail_path)
         segment_paths.append(tail_path)
 
         concat_list_path = os.path.join(tmpdir, f"concat_{uuid.uuid4().hex[:6]}.txt")
@@ -1157,28 +1157,43 @@ def make_video():
         try:
             opener_audio_url = social_sync.get("opener_audio_url")
             outro_audio_url = social_sync.get("outro_audio_url")
-            bumper_video_url = social_sync.get("bumper_video_url") or BUMPER_VIDEO_URL
+            # intro_video_url / outro_video_url (added): two distinct clips
+            # for head vs tail. Falls back to bumper_video_url (single clip
+            # reused both ends) or BUMPER_VIDEO_URL env var, so an older
+            # caller that hasn't been updated yet doesn't break.
+            legacy_bumper_url = social_sync.get("bumper_video_url") or BUMPER_VIDEO_URL
+            intro_video_url = social_sync.get("intro_video_url") or legacy_bumper_url
+            outro_video_url = social_sync.get("outro_video_url") or legacy_bumper_url
             tease_segments_data = social_sync.get("tease_segments")
             audio_start_offset = float(social_sync.get("audio_start_offset", 0.5))
 
             missing = [k for k, v in {
                 "opener_audio_url": opener_audio_url,
                 "outro_audio_url": outro_audio_url,
-                "bumper_video_url": bumper_video_url,
+                "intro_video_url": intro_video_url,
+                "outro_video_url": outro_video_url,
             }.items() if not v]
             if missing:
                 return jsonify({"error": f"social_sync missing required field(s): {', '.join(missing)}"}), 400
             if not isinstance(tease_segments_data, list) or len(tease_segments_data) < 1:
                 return jsonify({"error": "social_sync.tease_segments must be a non-empty list"}), 400
 
-            print("Downloading social_sync assets: opener, outro, bumper, "
-                  f"{len(tease_segments_data)} tease segment(s)")
+            print("Downloading social_sync assets: opener, outro, intro video, "
+                  f"outro video, {len(tease_segments_data)} tease segment(s)")
             opener_path = os.path.join(tmpdir, "opener.mp3")
             outro_path = os.path.join(tmpdir, "outro.mp3")
-            bumper_path = os.path.join(tmpdir, "bumper.mp4")
+            intro_video_path = os.path.join(tmpdir, "intro_video.mp4")
+            outro_video_path = os.path.join(tmpdir, "outro_video.mp4")
             download_file(opener_audio_url, opener_path)
             download_file(outro_audio_url, outro_path)
-            download_file(bumper_video_url, bumper_path)
+            download_file(intro_video_url, intro_video_path)
+            # Skip a redundant second download when both URLs are identical
+            # (e.g. the legacy_bumper_url fallback, or if the two really are
+            # meant to be the same clip for some future request).
+            if outro_video_url == intro_video_url:
+                outro_video_path = intro_video_path
+            else:
+                download_file(outro_video_url, outro_video_path)
 
             downloaded_tease_segments = []
             for i, seg in enumerate(tease_segments_data):
@@ -1197,10 +1212,10 @@ def make_video():
                 })
 
             music_url = social_sync.get("music_url") or select_music_url()
-            print("Building synced social video with head/tail bumper")
+            print("Building synced social video with distinct intro/outro clips")
             build_synced_bumper_video(
                 opener_path, outro_path, downloaded_tease_segments,
-                output_path, bumper_path,
+                output_path, intro_video_path, outro_video_path,
                 audio_start_offset=audio_start_offset,
                 music_url=music_url
             )
