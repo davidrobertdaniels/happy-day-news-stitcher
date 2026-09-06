@@ -57,11 +57,32 @@ CAPTION_MAX_CHARS_PER_LINE = 24
 CAPTION_MAX_LINES = 3
 CAPTION_FONT_SIZE = 64
 
+# ── KEN BURNS PAN/ZOOM (added 2026-09-05) ───────────────────────────────
+# Applied to social-video story images only (build_synced_bumper_video),
+# via build_single_image_segment's optional ken_burns_direction param, so
+# each still image gets slow, subtle movement instead of sitting frozen
+# for its whole segment. Entirely opt-in -- any caller that doesn't pass
+# ken_burns_direction gets identical output to before this change.
+KEN_BURNS_FPS = 30
+KEN_BURNS_MAX_ZOOM = 1.15
+KEN_BURNS_ZOOM_STEP = 0.0012
+# Cycled per story index for variety across a single episode's images.
+KEN_BURNS_DIRECTIONS = [
+    "zoom_in_center",
+    "zoom_out_left",
+    "zoom_in_right",
+    "zoom_out_center",
+    "zoom_in_left",
+    "zoom_out_right",
+]
+
+
 def download_file(url, dest_path, headers=None):
     r = requests.get(url, timeout=60, headers=headers or {})
     r.raise_for_status()
     with open(dest_path, "wb") as f:
         f.write(r.content)
+
 
 def select_music_url():
     """Pick a random track from MUSIC_URLS (comma-separated pool), falling
@@ -72,12 +93,14 @@ def select_music_url():
         return random.choice(pool)
     return TEASER_MUSIC_URL or None
 
+
 # NOTE: download_pexels_image() removed 2026-08-25. It attached a Pexels
 # Authorization header to every image download, but image_urls now come
 # from Google Drive share links (AI-generated illustrations), not Pexels
 # -- that header was stale/wrong dead code left over from before the
 # Pexels-to-AI-image-generation swap. All image downloads now just use
 # download_file() directly, headerless.
+
 
 def _wrap_caption(text, max_chars=CAPTION_MAX_CHARS_PER_LINE, max_lines=CAPTION_MAX_LINES):
     """Word-wrap caption text into a small number of short lines, since
@@ -95,6 +118,7 @@ def _wrap_caption(text, max_chars=CAPTION_MAX_CHARS_PER_LINE, max_lines=CAPTION_
         wrapped[-1] = last
     return "\n".join(wrapped)
 
+
 def _write_caption_textfile(caption, tmpdir):
     """Write wrapped caption text to a temp file for ffmpeg's drawtext
     textfile= option. Deliberately NOT using drawtext's inline text=
@@ -108,6 +132,7 @@ def _write_caption_textfile(caption, tmpdir):
         f.write(wrapped)
     return path
 
+
 def _drawtext_filter(caption_textfile_path):
     """Build the ffmpeg drawtext filter fragment for a near-top caption:
     white bold text on a semi-transparent black box, centered horizontally.
@@ -119,17 +144,26 @@ def _drawtext_filter(caption_textfile_path):
     Both the font path and the textfile path are escaped for use INSIDE an
     ffmpeg filter-graph string -- colons and backslashes are filter-graph
     syntax there, separate from any escaping the file contents themselves
-    might need (they need none, since textfile= reads plain text)."""
+    might need (they need none, since textfile= reads plain text).
+
+    Animated reveal (added 2026-09-05): the caption fades in and settles
+    down from 40px above its resting position over the segment's first
+    0.4s, instead of appearing instantly on frame 1 -- gives each story a
+    small "beat" when it starts rather than static text for the whole
+    segment."""
     def escape_for_filter(p):
         return p.replace("\\", "\\\\").replace(":", "\\:")
     escaped_path = escape_for_filter(caption_textfile_path)
     escaped_font = escape_for_filter(FONT_PATH)
+    fade_in_expr = "if(lt(t,0.4),t/0.4,1)"
+    slide_y_expr = "160+if(lt(t,0.4),(0.4-t)/0.4*40,0)"
     return (
         f"drawtext=fontfile='{escaped_font}':textfile='{escaped_path}':"
         f"fontsize={CAPTION_FONT_SIZE}:fontcolor=white:"
         f"box=1:boxcolor=black@0.55:boxborderw=20:"
-        f"x=(w-text_w)/2:y=160:line_spacing=12"
+        f"x=(w-text_w)/2:y='{slide_y_expr}':alpha='{fade_in_expr}':line_spacing=12"
     )
+
 
 def run_ffmpeg(cmd, error_label):
     try:
@@ -140,7 +174,9 @@ def run_ffmpeg(cmd, error_label):
         raise RuntimeError(f"{error_label}: {result.stderr}")
     return result
 
+
 FFMPEG_TIMEOUT_SECONDS = 240
+
 
 def stitch_audio(file_paths, output_path):
     """Stitch with per-clip loudnorm — used for main story block."""
@@ -165,6 +201,7 @@ def stitch_audio(file_paths, output_path):
     with open(list_path, "w") as f:
         for p in normalized_paths:
             f.write(f"file '{p}'\n")
+
     cmd = [
         "ffmpeg", "-y",
         "-f", "concat",
@@ -181,6 +218,7 @@ def stitch_audio(file_paths, output_path):
         for p in normalized_paths:
             os.unlink(p)
 
+
 def stitch_audio_raw(file_paths, output_path):
     """Stitch without per-clip normalisation — used for teaser block so the
     whole assembled block can be normalised as one unit before music mixing,
@@ -190,6 +228,7 @@ def stitch_audio_raw(file_paths, output_path):
     with open(list_path, "w") as f:
         for p in file_paths:
             f.write(f"file '{p}'\n")
+
     cmd = [
         "ffmpeg", "-y",
         "-f", "concat",
@@ -203,6 +242,7 @@ def stitch_audio_raw(file_paths, output_path):
         run_ffmpeg(cmd, "FFmpeg raw stitch error")
     finally:
         os.unlink(list_path)
+
 
 def normalise_audio(input_path, output_path):
     """Apply loudnorm to a single file as one unit."""
@@ -218,6 +258,7 @@ def normalise_audio(input_path, output_path):
     ]
     run_ffmpeg(cmd, "FFmpeg normalise error")
 
+
 def mix_beat_under_audio(voice_path, beat_path, output_path, volume="0.15"):
     cmd = [
         "ffmpeg", "-y",
@@ -232,6 +273,7 @@ def mix_beat_under_audio(voice_path, beat_path, output_path, volume="0.15"):
         output_path
     ]
     run_ffmpeg(cmd, "FFmpeg beat-mix error")
+
 
 def mix_beat_under_audio_with_tail(voice_path, beat_path, output_path, volume="0.15", tail_seconds=0.5, fade_duration=0.5, safety_buffer=0.15):
     """Mix beat under voice, extend beat by tail_seconds past voice end, then fade out.
@@ -278,6 +320,7 @@ def mix_beat_under_audio_with_tail(voice_path, beat_path, output_path, volume="0
     ]
     run_ffmpeg(cmd, "FFmpeg beat-mix-with-tail error")
 
+
 def apply_fade_out(input_path, output_path, fade_duration=1.5):
     """Apply fade out to end of audio. Default 1.5s for smooth transition
     before the throw sting fires after the last story segment."""
@@ -292,6 +335,7 @@ def apply_fade_out(input_path, output_path, fade_duration=1.5):
         output_path
     ]
     run_ffmpeg(cmd, "FFmpeg fade-out error")
+
 
 def pad_audio_start(input_path, output_path, delay_seconds=0.5):
     """Insert delay_seconds of silence at the start of the audio, so
@@ -310,6 +354,7 @@ def pad_audio_start(input_path, output_path, delay_seconds=0.5):
         output_path
     ]
     run_ffmpeg(cmd, "FFmpeg audio pad-start error")
+
 
 def build_bumper_segment(bumper_video_path, duration, output_path):
     """Render bumper_video_path as a fixed-duration SILENT video segment
@@ -333,6 +378,7 @@ def build_bumper_segment(bumper_video_path, duration, output_path):
     ]
     run_ffmpeg(cmd, "FFmpeg bumper segment error")
 
+
 def get_audio_duration(audio_path):
     """Get accurate audio duration by decoding the whole file, rather than
     trusting container-level metadata (ffprobe's format=duration).
@@ -355,6 +401,7 @@ def get_audio_duration(audio_path):
     # Fall back to container metadata only if decode-based parsing fails
     return _get_audio_duration_ffprobe(audio_path)
 
+
 def _get_audio_duration_ffprobe(audio_path):
     cmd = [
         "ffprobe", "-v", "error",
@@ -366,6 +413,7 @@ def _get_audio_duration_ffprobe(audio_path):
     if result.returncode != 0:
         raise RuntimeError(f"ffprobe error: {result.stderr}")
     return float(result.stdout.strip())
+
 
 def build_video_from_video_bg(video_path, audio_path, output_path):
     cmd = [
@@ -388,6 +436,7 @@ def build_video_from_video_bg(video_path, audio_path, output_path):
     ]
     run_ffmpeg(cmd, "FFmpeg video-bg error")
 
+
 def build_video_from_image_bg(image_path, audio_path, output_path):
     cmd = [
         "ffmpeg", "-y",
@@ -408,7 +457,53 @@ def build_video_from_image_bg(image_path, audio_path, output_path):
     ]
     run_ffmpeg(cmd, "FFmpeg image-bg error")
 
-def build_single_image_segment(image_path, duration, output_path, caption=None):
+
+def _kenburns_filter(duration, direction="zoom_in_center", fps=KEN_BURNS_FPS):
+    """Build the ffmpeg pre-scale + zoompan filter fragment for a slow
+    Ken Burns pan/zoom over a single still image, replacing the old
+    static scale+crop with no movement.
+
+    Pre-scales/crops to a buffer 20% larger than the final 1080x1920
+    frame so zoompan always has room to pan without ever exposing an
+    edge of the source image, then zoompan animates zoom level (in or
+    out) and crop position (toward one side or centered) across the
+    segment's full duration, with frame count `d` set from the segment's
+    real duration so the animation exactly spans it instead of freezing
+    early or running past the audio.
+
+    direction is one of: zoom_in_center, zoom_out_center, zoom_in_left,
+    zoom_in_right, zoom_out_left, zoom_out_right -- cycled per story by
+    the caller (see KEN_BURNS_DIRECTIONS) so a single episode's images
+    don't all move the same way."""
+    frames = max(1, round(duration * fps))
+    buffer_w, buffer_h = 1296, 2304  # 1080x1920 scaled up 20%, rounded to even
+
+    pre = (
+        f"scale={buffer_w}:{buffer_h}:force_original_aspect_ratio=increase,"
+        f"crop={buffer_w}:{buffer_h},setsar=1"
+    )
+
+    zoom_in = direction.startswith("zoom_in")
+    z_expr = (
+        f"min(zoom+{KEN_BURNS_ZOOM_STEP},{KEN_BURNS_MAX_ZOOM})" if zoom_in
+        else f"if(eq(on,0),{KEN_BURNS_MAX_ZOOM},max(zoom-{KEN_BURNS_ZOOM_STEP},1.0))"
+    )
+
+    # Fraction of the extra buffer space to pan toward (0.5 = centered).
+    pan_targets = {"center": (0.5, 0.5), "left": (0.15, 0.5), "right": (0.85, 0.5)}
+    side = direction.rsplit("_", 1)[-1]
+    px, py = pan_targets.get(side, (0.5, 0.5))
+    x_expr = f"(iw-iw/zoom)*{px}"
+    y_expr = f"(ih-ih/zoom)*{py}"
+
+    return (
+        pre + ","
+        f"zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':"
+        f"d={frames}:s=1080x1920:fps={fps}"
+    )
+
+
+def build_single_image_segment(image_path, duration, output_path, caption=None, ken_burns_direction=None):
     """Render one image as a short silent video segment of the given
     duration. Processes ONE image at a time so peak memory only ever
     holds a single decoded image stream — see build_video_from_multi_image_bg
@@ -417,9 +512,18 @@ def build_single_image_segment(image_path, duration, output_path, caption=None):
     caption (added 2026-08-26): optional short text to burn onto this
     segment via ffmpeg's drawtext filter (bottom-third, boxed). None by
     default -- existing callers that don't pass it get identical output to
+    before this change.
+
+    ken_burns_direction (added 2026-09-05): optional slow pan/zoom effect
+    (see _kenburns_filter) instead of a frozen static frame. None by
+    default -- existing callers that don't pass it get identical output to
     before this change."""
     tmpdir = os.path.dirname(output_path)
-    vf_parts = ["scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30"]
+
+    if ken_burns_direction:
+        vf_parts = [_kenburns_filter(duration, direction=ken_burns_direction)]
+    else:
+        vf_parts = ["scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30"]
 
     if caption:
         if not os.path.exists(FONT_PATH):
@@ -445,6 +549,7 @@ def build_single_image_segment(image_path, duration, output_path, caption=None):
         output_path
     ]
     run_ffmpeg(cmd, "FFmpeg single-image segment error")
+
 
 def build_video_from_multi_image_bg(image_paths, audio_path, output_path, captions=None):
     """Build a slideshow video from multiple images, hard-cutting between
@@ -534,6 +639,7 @@ def build_video_from_multi_image_bg(image_paths, audio_path, output_path, captio
         if silent_video_path and os.path.exists(silent_video_path):
             os.unlink(silent_video_path)
 
+
 def build_video_with_bumpers(image_paths, audio_path, output_path, bumper_video_path,
                               bumper_duration=5.0, audio_start_offset=0.5, captions=None):
     """Build a video with a fixed-duration bumper clip at the head AND
@@ -584,8 +690,8 @@ def build_video_with_bumpers(image_paths, audio_path, output_path, bumper_video_
 
     padded_audio_path = os.path.join(tmpdir, f"padded_audio_{uuid.uuid4().hex[:6]}.mp3")
     pad_audio_start(audio_path, padded_audio_path, delay_seconds=audio_start_offset)
-
     total_duration = get_audio_duration(padded_audio_path)
+
     if total_duration < (2 * bumper_duration):
         raise RuntimeError(
             f"Narration audio ({total_duration:.2f}s including {audio_start_offset}s "
@@ -656,6 +762,7 @@ def build_video_with_bumpers(image_paths, audio_path, output_path, bumper_video_
             os.unlink(concat_list_path)
         if silent_video_path and os.path.exists(silent_video_path):
             os.unlink(silent_video_path)
+
 
 def build_synced_bumper_video(opener_audio_path, outro_audio_path, tease_segments,
                                output_path, intro_video_path, outro_video_path,
@@ -759,7 +866,9 @@ def build_synced_bumper_video(opener_audio_path, outro_audio_path, tease_segment
         for i, seg in enumerate(tease_segments):
             seg_path = os.path.join(tmpdir, f"tease_{i}_{uuid.uuid4().hex[:6]}.mp4")
             build_single_image_segment(
-                seg["image_path"], tease_durs[i], seg_path, caption=seg.get("caption")
+                seg["image_path"], tease_durs[i], seg_path,
+                caption=seg.get("caption"),
+                ken_burns_direction=KEN_BURNS_DIRECTIONS[i % len(KEN_BURNS_DIRECTIONS)],
             )
             segment_paths.append(seg_path)
 
@@ -806,6 +915,7 @@ def build_synced_bumper_video(opener_audio_path, outro_audio_path, tease_segment
             os.unlink(concat_list_path)
         if silent_video_path and os.path.exists(silent_video_path):
             os.unlink(silent_video_path)
+
 
 def build_video_from_segments(segments, output_path, music_url=None):
     """Build a video where each image is shown for exactly the duration of
@@ -906,9 +1016,11 @@ def build_video_from_segments(segments, output_path, music_url=None):
         if silent_video_path and os.path.exists(silent_video_path):
             os.unlink(silent_video_path)
 
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
+
 
 @app.route("/stitch", methods=["POST"])
 def stitch():
@@ -942,7 +1054,6 @@ def stitch():
     beat_url = data.get("beat_url") or BEAT_URL
     teaser_music_url = data.get("teaser_music_url") or TEASER_MUSIC_URL
     closing_beat_url = data.get("closing_beat_url") or CLOSING_BEAT_URL
-
     # intro_swish — new audio, plays after leadIn and between each tease line,
     # and once more before "But first,". Nothing plays after "But first,".
     intro_swish_url = data.get("intro_swish_url") or INTRO_SWISH_URL
@@ -1038,8 +1149,8 @@ def stitch():
 
             norm_teaser_path = os.path.join(tmpdir, "teaser_norm.mp3")
             normalise_audio(raw_teaser_path, norm_teaser_path)
-
             final_teaser_path = norm_teaser_path
+
             if teaser_music_url:
                 try:
                     teaser_music_path = os.path.join(tmpdir, "teaser_music.mp3")
@@ -1093,8 +1204,8 @@ def stitch():
         if real_sequence:
             stories_block_path = os.path.join(tmpdir, "stories_block.mp3")
             stitch_audio(real_sequence, stories_block_path)
-
             final_stories_block = stories_block_path
+
             if beat_url:
                 try:
                     beat_path = os.path.join(tmpdir, "beat.mp3")
@@ -1127,6 +1238,7 @@ def stitch():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 @app.route("/make-video", methods=["POST"])
 def make_video():
@@ -1180,10 +1292,12 @@ def make_video():
 
             print("Downloading social_sync assets: opener, outro, intro video, "
                   f"outro video, {len(tease_segments_data)} tease segment(s)")
+
             opener_path = os.path.join(tmpdir, "opener.mp3")
             outro_path = os.path.join(tmpdir, "outro.mp3")
             intro_video_path = os.path.join(tmpdir, "intro_video.mp4")
             outro_video_path = os.path.join(tmpdir, "outro_video.mp4")
+
             download_file(opener_audio_url, opener_path)
             download_file(outro_audio_url, outro_path)
             download_file(intro_video_url, intro_video_path)
@@ -1212,6 +1326,7 @@ def make_video():
                 })
 
             music_url = social_sync.get("music_url") or select_music_url()
+
             print("Building synced social video with distinct intro/outro clips")
             build_synced_bumper_video(
                 opener_path, outro_path, downloaded_tease_segments,
@@ -1227,6 +1342,7 @@ def make_video():
                 as_attachment=True,
                 download_name=f"happy_day_news_video_{job_id}.mp4"
             )
+
         except Exception as e:
             print(f"make-video (social_sync mode) error: {e}")
             return jsonify({"error": str(e)}), 500
@@ -1266,6 +1382,7 @@ def make_video():
                 })
 
             music_url = data.get("music_url") or select_music_url()
+
             print(f"Building synced-segments video ({len(downloaded_segments)} segments)")
             build_video_from_segments(downloaded_segments, output_path, music_url=music_url)
             print("Synced-segments video built successfully")
@@ -1276,6 +1393,7 @@ def make_video():
                 as_attachment=True,
                 download_name=f"happy_day_news_video_{job_id}.mp4"
             )
+
         except Exception as e:
             print(f"make-video (segments mode) error: {e}")
             return jsonify({"error": str(e)}), 500
@@ -1306,7 +1424,6 @@ def make_video():
         video_url = None
     else:
         video_url = data.get("video_url") or BACKGROUND_VIDEO_URL
-
     image_url = data.get("image_url") or BACKGROUND_IMAGE_URL
 
     if not video_url and not has_explicit_image_urls and not image_url:
@@ -1338,7 +1455,6 @@ def make_video():
                 print(f"Music mixing failed, continuing without music: {e}")
 
         video_succeeded = False
-
         if video_url:
             try:
                 print(f"Trying video background: {video_url}")
@@ -1368,8 +1484,10 @@ def make_video():
                     download_file(url, img_path)
                     print(f"Image {i+1} downloaded")
                     image_paths.append(img_path)
+
                 bumper_path = os.path.join(tmpdir, "bumper.mp4")
                 download_file(bumper_video_url, bumper_path)
+
                 print(f"Building video with {bumper_duration}s head/tail bumper")
                 build_video_with_bumpers(
                     image_paths, audio_path, output_path, bumper_path,
@@ -1386,6 +1504,7 @@ def make_video():
                     download_file(url, img_path)
                     print(f"Image {i+1} downloaded")
                     image_paths.append(img_path)
+
                 print(f"Building multi-image slideshow")
                 build_video_from_multi_image_bg(image_paths, audio_path, output_path, captions=captions)
                 print(f"Slideshow built successfully")
@@ -1407,6 +1526,7 @@ def make_video():
     except Exception as e:
         print(f"make-video error: {e}")
         return jsonify({"error": str(e), "used_fallback": used_fallback if 'used_fallback' in locals() else False}), 500
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
