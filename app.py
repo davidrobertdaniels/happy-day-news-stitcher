@@ -865,10 +865,23 @@ def build_synced_bumper_video(opener_audio_path, outro_audio_path, tease_segment
 
         for i, seg in enumerate(tease_segments):
             seg_path = os.path.join(tmpdir, f"tease_{i}_{uuid.uuid4().hex[:6]}.mp4")
+            # FIX (Render free-tier FFmpeg timeout, 2026-09-07): the Ken Burns
+            # zoompan effect enabled here 2026-09-06 renders every output frame
+            # of the pre-scaled 1296x2304 buffer through zoompan, which is far
+            # more CPU-hungry than the old static scale+crop. On this service's
+            # 0.15 vCPU free-tier instance that consistently blew the 240s
+            # per-segment FFMPEG_TIMEOUT_SECONDS budget -- confirmed by 3/3
+            # make-video (social_sync mode) failures in the ~2 hours after this
+            # went live, all timing out on this exact call, with CPU metrics
+            # pegged at the 0.15 core limit throughout. Reverting to the static
+            # frame (ken_burns_direction=None, i.e. omitted) here restores the
+            # behavior that ran reliably for weeks before 2026-09-06. The Ken
+            # Burns code itself is left in place -- reintroduce it here only
+            # after either upgrading the instance plan or confirming a single
+            # zoompan segment reliably finishes well under 240s on this plan.
             build_single_image_segment(
                 seg["image_path"], tease_durs[i], seg_path,
                 caption=seg.get("caption"),
-                ken_burns_direction=KEN_BURNS_DIRECTIONS[i % len(KEN_BURNS_DIRECTIONS)],
             )
             segment_paths.append(seg_path)
 
