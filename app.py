@@ -503,7 +503,76 @@ def _kenburns_filter(duration, direction="zoom_in_center", fps=KEN_BURNS_FPS):
     )
 
 
-def build_single_image_segment(image_path, duration, output_path, caption=None, ken_burns_direction=None):
+# ── LIGHTWEIGHT PAN (added 2026-09-07) ──────────────────────────────────
+# Replacement for the Ken Burns zoompan effect on the social clip's tease
+# images (see the FIX comment in build_synced_bumper_video below for why
+# zoompan was reverted 2026-09-07 -- it blew the 240s per-segment timeout
+# on this service's 0.15 vCPU free-tier instance). zoompan is expensive
+# regardless of its settings because it regenerates every output frame
+# through its own internal resample/zoom math. A plain `crop` with a
+# time-varying position is a much lighter per-frame operation -- crop is a
+# simple slice, not a resample -- so a pure pan (no zoom) implemented this
+# way should stay close to the static scale+crop's cost instead of
+# zoompan's, while still delivering visible movement. Entirely opt-in --
+# any caller that doesn't pass pan_direction gets identical output to
+# before this change.
+PAN_BUFFER_MARGIN = 0.20  # same oversize margin the old Ken Burns buffer used
+PAN_DIRECTIONS = [
+    "left_to_right",
+    "top_to_bottom",
+    "right_to_left",
+    "bottom_to_top",
+]
+
+
+def _pan_filter(duration, direction="left_to_right"):
+    """Build the ffmpeg pre-scale + crop filter fragment for a slow,
+    constant-rate pan across a still image -- no zoom. Pre-scales/crops to
+    a buffer PAN_BUFFER_MARGIN larger than the final 1080x1920 frame (same
+    margin the old Ken Burns effect used) so there's room to pan without
+    ever exposing an edge of the source image, then crops a 1080x1920
+    window that slides linearly across that buffer over the segment's full
+    duration. ffmpeg's crop filter re-evaluates x/y natively every output
+    frame whenever the expression references `t` (no separate eval=frame
+    flag needed/available on crop, unlike zoompan) -- clip(...) guards
+    against any floating-point overshoot on the last frame landing outside
+    the valid range."""
+    buffer_w = int(round(1080 * (1 + PAN_BUFFER_MARGIN) / 2) * 2)
+    buffer_h = int(round(1920 * (1 + PAN_BUFFER_MARGIN) / 2) * 2)
+    margin_x = buffer_w - 1080
+    margin_y = buffer_h - 1920
+    d = max(duration, 0.01)
+
+    pre = (
+        f"scale={buffer_w}:{buffer_h}:force_original_aspect_ratio=increase,"
+        f"crop={buffer_w}:{buffer_h},setsar=1"
+    )
+
+    if direction == "left_to_right":
+        x_expr = f"clip((t/{d:.3f})*{margin_x},0,{margin_x})"
+        y_expr = f"{margin_y / 2:.1f}"
+    elif direction == "right_to_left":
+        x_expr = f"clip({margin_x}*(1-t/{d:.3f}),0,{margin_x})"
+        y_expr = f"{margin_y / 2:.1f}"
+    elif direction == "top_to_bottom":
+        x_expr = f"{margin_x / 2:.1f}"
+        y_expr = f"clip((t/{d:.3f})*{margin_y},0,{margin_y})"
+    elif direction == "bottom_to_top":
+        x_expr = f"{margin_x / 2:.1f}"
+        y_expr = f"clip({margin_y}*(1-t/{d:.3f}),0,{margin_y})"
+    else:
+        x_expr = f"{margin_x / 2:.1f}"
+        y_expr = f"{margin_y / 2:.1f}"
+
+    return (
+        pre + ","
+        f"crop=1080:1920:x='{x_expr}':y='{y_expr}',"
+        f"fps=30"
+    )
+
+
+def build_single_image_segment(image_path, duration, output_path, caption=None,
+                                ken_burns_direction=None, pan_direction=None):
     """Render one image as a short silent video segment of the given
     duration. Processes ONE image at a time so peak memory only ever
     holds a single decoded image stream — see build_video_from_multi_image_bg
@@ -514,13 +583,25 @@ def build_single_image_segment(image_path, duration, output_path, caption=None, 
     default -- existing callers that don't pass it get identical output to
     before this change.
 
-    ken_burns_direction (added 2026-09-05): optional slow pan/zoom effect
-    (see _kenburns_filter) instead of a frozen static frame. None by
-    default -- existing callers that don't pass it get identical output to
-    before this change."""
+    ken_burns_direction (added 2026-09-05, DO NOT re-enable for the social
+    tease segments without re-reading the 2026-09-07 FIX comment in
+    build_synced_bumper_video -- this is what caused that outage): optional
+    zoompan pan/zoom effect (see _kenburns_filter). Kept for any future
+    caller that has CPU headroom to afford it; not used anywhere in this
+    file as of 2026-09-07.
+
+    pan_direction (added 2026-09-07): optional lightweight pan-only effect
+    (see _pan_filter) -- the low-cost replacement for ken_burns_direction,
+    used by the social tease segments. Takes priority over
+    ken_burns_direction if both are somehow passed.
+
+    Neither optional effect is applied by default -- existing callers that
+    pass neither get identical output to before either was added."""
     tmpdir = os.path.dirname(output_path)
 
-    if ken_burns_direction:
+    if pan_direction:
+        vf_parts = [_pan_filter(duration, direction=pan_direction)]
+    elif ken_burns_direction:
         vf_parts = [_kenburns_filter(duration, direction=ken_burns_direction)]
     else:
         vf_parts = ["scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30"]
@@ -873,15 +954,20 @@ def build_synced_bumper_video(opener_audio_path, outro_audio_path, tease_segment
             # per-segment FFMPEG_TIMEOUT_SECONDS budget -- confirmed by 3/3
             # make-video (social_sync mode) failures in the ~2 hours after this
             # went live, all timing out on this exact call, with CPU metrics
-            # pegged at the 0.15 core limit throughout. Reverting to the static
-            # frame (ken_burns_direction=None, i.e. omitted) here restores the
-            # behavior that ran reliably for weeks before 2026-09-06. The Ken
-            # Burns code itself is left in place -- reintroduce it here only
-            # after either upgrading the instance plan or confirming a single
-            # zoompan segment reliably finishes well under 240s on this plan.
+            # pegged at the 0.15 core limit throughout. DO NOT pass
+            # ken_burns_direction here again without re-reading this comment.
+            #
+            # UPDATE (2026-09-07, same day): replaced the frozen static frame
+            # with pan_direction instead -- a lightweight pan-only effect (see
+            # _pan_filter) that uses ffmpeg's plain `crop` filter rather than
+            # zoompan, so it stays close to the static crop's cost instead of
+            # zoompan's. Restores visible movement without reintroducing the
+            # timeout. Cycled per tease index via PAN_DIRECTIONS so a single
+            # episode's 3 images don't all pan the same way.
             build_single_image_segment(
                 seg["image_path"], tease_durs[i], seg_path,
                 caption=seg.get("caption"),
+                pan_direction=PAN_DIRECTIONS[i % len(PAN_DIRECTIONS)],
             )
             segment_paths.append(seg_path)
 
