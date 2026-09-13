@@ -53,9 +53,9 @@ FONT_PATH = os.environ.get(
     "FONT_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "DejaVuSans-Bold.ttf")
 )
-CAPTION_MAX_CHARS_PER_LINE = 24
-CAPTION_MAX_LINES = 3
-CAPTION_FONT_SIZE = 64
+CAPTION_MAX_CHARS_PER_LINE = 32
+CAPTION_MAX_LINES = 5
+CAPTION_FONT_SIZE = 52
 
 # ── KEN BURNS PAN/ZOOM (added 2026-09-05) ───────────────────────────────
 # Applied to social-video story images only (build_synced_bumper_video),
