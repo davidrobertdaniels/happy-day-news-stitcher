@@ -53,9 +53,15 @@ FONT_PATH = os.environ.get(
     "FONT_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "DejaVuSans-Bold.ttf")
 )
-CAPTION_MAX_CHARS_PER_LINE = 32
+# SIZE CHANGE (2026-09-25): font size doubled 52 -> 104 per feedback.
+# Max chars per line cut 32 -> 16 to match, so a full line still fits
+# inside the 1080px frame at the larger size (tested: a 16-char mixed-case
+# line of DejaVu Sans Bold at 104px fits with the box border).
+CAPTION_MAX_CHARS_PER_LINE = 16
 CAPTION_MAX_LINES = 5
-CAPTION_FONT_SIZE = 52
+CAPTION_FONT_SIZE = 104
+CAPTION_LINE_SPACING = 24
+CAPTION_BOX_BORDER = 28
 
 # ── KEN BURNS PAN/ZOOM (added 2026-09-05) ───────────────────────────────
 # Applied to social-video story images only (build_synced_bumper_video),
@@ -150,7 +156,14 @@ def _drawtext_filter(caption_textfile_path):
     down from 40px above its resting position over the segment's first
     0.4s, instead of appearing instantly on frame 1 -- gives each story a
     small "beat" when it starts rather than static text for the whole
-    segment."""
+    segment.
+
+    FIX (missing caption bug, 2026-09-25): expansion=none is required.
+    drawtext's default expansion mode treats '%' as the start of a
+    %{...} expansion sequence, so any caption containing a percent sign
+    (e.g. "From 2.6% To 97%!") hit a "Stray %" error and ffmpeg silently
+    drew NO text on that segment while still rendering the image. With
+    expansion=none the text file is drawn literally, whatever it contains."""
     def escape_for_filter(p):
         return p.replace("\\", "\\\\").replace(":", "\\:")
     escaped_path = escape_for_filter(caption_textfile_path)
@@ -159,9 +172,11 @@ def _drawtext_filter(caption_textfile_path):
     slide_y_expr = "160+if(lt(t,0.4),(0.4-t)/0.4*40,0)"
     return (
         f"drawtext=fontfile='{escaped_font}':textfile='{escaped_path}':"
+        f"expansion=none:"
         f"fontsize={CAPTION_FONT_SIZE}:fontcolor=white:"
-        f"box=1:boxcolor=black@0.55:boxborderw=20:"
-        f"x=(w-text_w)/2:y='{slide_y_expr}':alpha='{fade_in_expr}':line_spacing=12"
+        f"box=1:boxcolor=black@0.55:boxborderw={CAPTION_BOX_BORDER}:"
+        f"x=(w-text_w)/2:y='{slide_y_expr}':alpha='{fade_in_expr}':"
+        f"line_spacing={CAPTION_LINE_SPACING}"
     )
 
 
@@ -579,7 +594,7 @@ def build_single_image_segment(image_path, duration, output_path, caption=None,
     below for why this matters.
 
     caption (added 2026-08-26): optional short text to burn onto this
-    segment via ffmpeg's drawtext filter (bottom-third, boxed). None by
+    segment via ffmpeg's drawtext filter (near-top, boxed). None by
     default -- existing callers that don't pass it get identical output to
     before this change.
 
