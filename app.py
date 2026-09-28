@@ -63,6 +63,20 @@ CAPTION_FONT_SIZE = 104
 CAPTION_LINE_SPACING = 24
 CAPTION_BOX_BORDER = 28
 
+# ── HDN TITLE OVERLAY (added 2026-09-28) ────────────────────────────────
+# Static "Happy Day News" title PNG (transparent, ~1175x334) composited onto
+# the social tease image segments only (build_synced_bumper_video, via
+# build_single_image_segment's logo_overlay param). Scaled to LOGO_WIDTH
+# (aspect ratio kept), centred horizontally, top edge at LOGO_Y. LOGO_PATH
+# is resolved relative to this file like FONT_PATH. If the PNG is missing
+# the overlay is logged and skipped -- it never fails the render.
+LOGO_PATH = os.environ.get(
+    "LOGO_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "hdn_title.png")
+)
+LOGO_WIDTH = int(os.environ.get("LOGO_WIDTH", "860"))
+LOGO_Y = int(os.environ.get("LOGO_Y", "1440"))
+
 # ── KEN BURNS PAN/ZOOM (added 2026-09-05) ───────────────────────────────
 # Applied to social-video story images only (build_synced_bumper_video),
 # via build_single_image_segment's optional ken_burns_direction param, so
@@ -587,7 +601,8 @@ def _pan_filter(duration, direction="left_to_right"):
 
 
 def build_single_image_segment(image_path, duration, output_path, caption=None,
-                                ken_burns_direction=None, pan_direction=None):
+                                ken_burns_direction=None, pan_direction=None,
+                                logo_overlay=False):
     """Render one image as a short silent video segment of the given
     duration. Processes ONE image at a time so peak memory only ever
     holds a single decoded image stream — see build_video_from_multi_image_bg
@@ -611,7 +626,15 @@ def build_single_image_segment(image_path, duration, output_path, caption=None,
     ken_burns_direction if both are somehow passed.
 
     Neither optional effect is applied by default -- existing callers that
-    pass neither get identical output to before either was added."""
+    pass neither get identical output to before either was added.
+
+    logo_overlay (added 2026-09-28): if True, composites the static HDN
+    title PNG (LOGO_PATH) after the pan/zoom filter and before the caption
+    drawtext, via filter_complex with the PNG as a second input. The PNG is
+    a single frame scaled once; overlay repeats it for the whole segment,
+    so the per-frame cost is just the blend. Skipped (with a log line) if
+    the PNG is missing. False by default -- existing callers get identical
+    output to before this was added."""
     tmpdir = os.path.dirname(output_path)
 
     if pan_direction:
@@ -621,6 +644,11 @@ def build_single_image_segment(image_path, duration, output_path, caption=None,
     else:
         vf_parts = ["scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30"]
 
+    if logo_overlay and not os.path.exists(LOGO_PATH):
+        print(f"HDN title overlay skipped: logo file not found at {LOGO_PATH}")
+        logo_overlay = False
+
+    caption_filter = None
     if caption:
         if not os.path.exists(FONT_PATH):
             raise RuntimeError(
@@ -629,14 +657,36 @@ def build_single_image_segment(image_path, duration, output_path, caption=None,
                 f"DejaVuSans-Bold.ttf, next to app.py) or set the FONT_PATH env var."
             )
         caption_textfile = _write_caption_textfile(caption, tmpdir)
-        vf_parts.append(_drawtext_filter(caption_textfile))
+        caption_filter = _drawtext_filter(caption_textfile)
+
+    if logo_overlay:
+        # Base chain -> overlay the scaled logo -> caption on top, so the
+        # caption box is never hidden under the logo.
+        graph = (
+            f"[0:v]{','.join(vf_parts)}[base];"
+            f"[1:v]format=rgba,scale={LOGO_WIDTH}:-1[logo];"
+            f"[base][logo]overlay=x=(W-w)/2:y={LOGO_Y}"
+        )
+        if caption_filter:
+            graph += f",{caption_filter}"
+        graph += "[v]"
+        filter_args = [
+            "-i", LOGO_PATH,
+            "-filter_complex", graph,
+            "-map", "[v]",
+            "-t", f"{duration:.3f}",
+        ]
+    else:
+        if caption_filter:
+            vf_parts.append(caption_filter)
+        filter_args = ["-vf", ",".join(vf_parts)]
 
     cmd = [
         "ffmpeg", "-y",
         "-loop", "1",
         "-t", f"{duration:.3f}",
         "-i", image_path,
-        "-vf", ",".join(vf_parts),
+        *filter_args,
         "-c:v", "libx264",
         "-tune", "stillimage",
         "-preset", "ultrafast",
@@ -983,6 +1033,7 @@ def build_synced_bumper_video(opener_audio_path, outro_audio_path, tease_segment
                 seg["image_path"], tease_durs[i], seg_path,
                 caption=seg.get("caption"),
                 pan_direction=PAN_DIRECTIONS[i % len(PAN_DIRECTIONS)],
+                logo_overlay=True,
             )
             segment_paths.append(seg_path)
 
