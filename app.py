@@ -600,6 +600,157 @@ def _pan_filter(duration, direction="left_to_right"):
     )
 
 
+# ── CONTINUOUS PANORAMA PAN (added 2026-10-03) ──────────────────────────
+# Social tease section can now use ONE wide panorama image (all stories in
+# a single scene, left to right) instead of one image per story. The
+# panorama is scaled to the 1920px frame height and a 1080px window pans
+# continuously left to right across the WHOLE tease section, timed so each
+# story's area is on screen while its tease line plays.
+#
+# Still rendered one tease segment at a time (same memory-safe pattern as
+# everything else in this file). Each segment evaluates the same global
+# pan path, offset by that segment's start time, so the motion is seamless
+# across the cuts. Cost per frame is just a crop: the image is decoded and
+# scaled ONCE per segment (loop filter), not every frame, and no zoompan.
+#
+# Opt-in only: used when social_sync has pan_mode == "continuous_panorama"
+# and panorama_url. Every other request is unchanged.
+PANORAMA_FRAME_W = 1080
+PANORAMA_FRAME_H = 1920
+PANORAMA_FPS = 30
+
+
+def _get_image_size(image_path):
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "csv=p=0:s=x",
+        image_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffprobe image-size error: {result.stderr}")
+    w, h = result.stdout.strip().split("x")[:2]
+    return int(w), int(h)
+
+
+def panorama_geometry(image_path):
+    """Return (scale_filter, max_x) for fitting the panorama to the frame
+    height. If the image is somehow narrower than the frame, fall back to
+    a cover-fit with no horizontal travel (max_x = 0)."""
+    w, h = _get_image_size(image_path)
+    scaled_w = int(round(w * PANORAMA_FRAME_H / h / 2) * 2)
+    if scaled_w >= PANORAMA_FRAME_W:
+        return f"scale={scaled_w}:{PANORAMA_FRAME_H},setsar=1", scaled_w - PANORAMA_FRAME_W
+    return (
+        f"scale={PANORAMA_FRAME_W}:{PANORAMA_FRAME_H}:force_original_aspect_ratio=increase,"
+        f"crop={PANORAMA_FRAME_W}:{PANORAMA_FRAME_H},setsar=1"
+    ), 0
+
+
+def panorama_keyframes(tease_durs, max_x):
+    """Pan path keyframes as (time, x) across the whole tease section.
+    Starts at the far left at t=0 and ends at the far right when the last
+    tease finishes, so the movement is continuous throughout. Each middle
+    story is centred in frame at the midpoint of its own tease audio. Story
+    i's area centre sits at (i + 0.5) / n of the panorama width."""
+    n = len(tease_durs)
+    total = sum(tease_durs)
+    scaled_w = max_x + PANORAMA_FRAME_W
+    keys = [(0.0, 0.0)]
+    start = 0.0
+    for i, d in enumerate(tease_durs):
+        if 0 < i < n - 1:
+            mid = start + d / 2
+            x = scaled_w * (i + 0.5) / n - PANORAMA_FRAME_W / 2
+            x = min(max(x, 0.0), float(max_x))
+            if mid > keys[-1][0]:
+                keys.append((mid, x))
+        start += d
+    if total > keys[-1][0]:
+        keys.append((total, float(max_x)))
+    return keys
+
+
+def _panorama_x_expr(keys, segment_start, max_x):
+    """Piecewise-linear x(T) through keys, where T = t + segment_start is
+    the global time across the whole tease section."""
+    T = f"(t+{segment_start:.3f})"
+    expr = f"{keys[-1][1]:.1f}"
+    for k in range(len(keys) - 2, -1, -1):
+        t0, x0 = keys[k]
+        t1, x1 = keys[k + 1]
+        span = max(t1 - t0, 0.001)
+        seg = f"{x0:.1f}+({x1 - x0:.1f})*({T}-{t0:.3f})/{span:.3f}"
+        expr = f"if(lt({T},{t1:.3f}),{seg},{expr})"
+    return f"clip({expr},0,{max_x})"
+
+
+def build_panorama_tease_segment(panorama_path, duration, output_path, scale_filter,
+                                 keys, segment_start, max_x, caption=None,
+                                 logo_overlay=False):
+    """Render one tease segment as a window onto the shared panorama,
+    following the global pan path from segment_start for duration seconds.
+    Same logo overlay + caption + encode settings as
+    build_single_image_segment, so the concat demuxer can join it with the
+    bumper segments using -c copy."""
+    tmpdir = os.path.dirname(output_path)
+    x_expr = _panorama_x_expr(keys, segment_start, max_x)
+    base = (
+        f"[0:v]{scale_filter},"
+        f"loop=loop=-1:size=1:start=0,"
+        f"setpts=N/{PANORAMA_FPS}/TB,"
+        f"crop={PANORAMA_FRAME_W}:{PANORAMA_FRAME_H}:x='{x_expr}':y=0,"
+        f"format=yuv420p"
+    )
+
+    if logo_overlay and not os.path.exists(LOGO_PATH):
+        print(f"HDN title overlay skipped: logo file not found at {LOGO_PATH}")
+        logo_overlay = False
+
+    caption_filter = None
+    if caption:
+        if not os.path.exists(FONT_PATH):
+            raise RuntimeError(
+                f"Caption requested but font file not found at {FONT_PATH}. "
+                f"Add a .ttf font to the repo (default expected path: "
+                f"DejaVuSans-Bold.ttf, next to app.py) or set the FONT_PATH env var."
+            )
+        caption_textfile = _write_caption_textfile(caption, tmpdir)
+        caption_filter = _drawtext_filter(caption_textfile)
+
+    inputs = ["-i", panorama_path]
+    if logo_overlay:
+        inputs += ["-i", LOGO_PATH]
+        graph = (
+            f"{base}[base];"
+            f"[1:v]format=rgba,scale={LOGO_WIDTH}:-1[logo];"
+            f"[base][logo]overlay=x=(W-w)/2:y={LOGO_Y}"
+        )
+    else:
+        graph = base
+    if caption_filter:
+        graph += f",{caption_filter}"
+    graph += "[v]"
+
+    cmd = [
+        "ffmpeg", "-y",
+        *inputs,
+        "-filter_complex", graph,
+        "-map", "[v]",
+        "-t", f"{duration:.3f}",
+        "-r", str(PANORAMA_FPS),
+        "-c:v", "libx264",
+        "-tune", "stillimage",
+        "-preset", "ultrafast",
+        "-crf", "28",
+        "-pix_fmt", "yuv420p",
+        output_path
+    ]
+    run_ffmpeg(cmd, "FFmpeg panorama segment error")
+
+
 def build_single_image_segment(image_path, duration, output_path, caption=None,
                                 ken_burns_direction=None, pan_direction=None,
                                 logo_overlay=False):
@@ -912,7 +1063,8 @@ def build_video_with_bumpers(image_paths, audio_path, output_path, bumper_video_
 
 def build_synced_bumper_video(opener_audio_path, outro_audio_path, tease_segments,
                                output_path, intro_video_path, outro_video_path,
-                               audio_start_offset=0.5, music_url=None):
+                               audio_start_offset=0.5, music_url=None,
+                               panorama_path=None):
     """Build a video where the head/tail bumper and each story image are
     each sized to their OWN real spoken audio duration, so visual cuts land
     exactly on story changes rather than an arbitrary fixed split.
@@ -968,6 +1120,12 @@ def build_synced_bumper_video(opener_audio_path, outro_audio_path, tease_segment
     opener_dur = get_audio_duration(opener_audio_path)
     outro_dur = get_audio_duration(outro_audio_path)
     tease_durs = [get_audio_duration(seg["audio_path"]) for seg in tease_segments]
+
+    pano_scale, pano_max_x, pano_keys = None, 0, None
+    if panorama_path:
+        pano_scale, pano_max_x = panorama_geometry(panorama_path)
+        pano_keys = panorama_keyframes(tease_durs, pano_max_x)
+        print(f"Panorama pan: max_x={pano_max_x}, keyframes={pano_keys}")
 
     head_bumper_duration = audio_start_offset + opener_dur
     tail_bumper_duration = outro_dur
@@ -1029,12 +1187,22 @@ def build_synced_bumper_video(opener_audio_path, outro_audio_path, tease_segment
             # zoompan's. Restores visible movement without reintroducing the
             # timeout. Cycled per tease index via PAN_DIRECTIONS so a single
             # episode's 3 images don't all pan the same way.
-            build_single_image_segment(
-                seg["image_path"], tease_durs[i], seg_path,
-                caption=seg.get("caption"),
-                pan_direction=PAN_DIRECTIONS[i % len(PAN_DIRECTIONS)],
-                logo_overlay=True,
-            )
+            if panorama_path:
+                # Continuous panorama mode (2026-10-03): see the CONTINUOUS
+                # PANORAMA PAN section above.
+                build_panorama_tease_segment(
+                    panorama_path, tease_durs[i], seg_path,
+                    pano_scale, pano_keys, sum(tease_durs[:i]), pano_max_x,
+                    caption=seg.get("caption"),
+                    logo_overlay=True,
+                )
+            else:
+                build_single_image_segment(
+                    seg["image_path"], tease_durs[i], seg_path,
+                    caption=seg.get("caption"),
+                    pan_direction=PAN_DIRECTIONS[i % len(PAN_DIRECTIONS)],
+                    logo_overlay=True,
+                )
             segment_paths.append(seg_path)
 
         tail_path = os.path.join(tmpdir, f"bumper_tail_{uuid.uuid4().hex[:6]}.mp4")
@@ -1474,16 +1642,28 @@ def make_video():
             else:
                 download_file(outro_video_url, outro_video_path)
 
+            # Continuous panorama mode (added 2026-10-03): one wide image
+            # downloaded once and panned across all tease segments.
+            panorama_url = social_sync.get("panorama_url")
+            panorama_path = None
+            if social_sync.get("pan_mode") == "continuous_panorama" and panorama_url:
+                panorama_path = os.path.join(tmpdir, "panorama.png")
+                download_file(panorama_url, panorama_path)
+                print("Panorama downloaded (continuous_panorama mode)")
+
             downloaded_tease_segments = []
             for i, seg in enumerate(tease_segments_data):
                 seg_audio_url = seg.get("audio_url")
                 seg_image_url = seg.get("image_url")
-                if not seg_audio_url or not seg_image_url:
+                if not seg_audio_url or (not seg_image_url and not panorama_path):
                     return jsonify({"error": f"social_sync.tease_segments[{i}] missing audio_url or image_url"}), 400
                 a_path = os.path.join(tmpdir, f"tease_audio_{i}.mp3")
-                i_path = os.path.join(tmpdir, f"tease_image_{i}.jpg")
                 download_file(seg_audio_url, a_path)
-                download_file(seg_image_url, i_path)
+                if panorama_path:
+                    i_path = panorama_path
+                else:
+                    i_path = os.path.join(tmpdir, f"tease_image_{i}.jpg")
+                    download_file(seg_image_url, i_path)
                 downloaded_tease_segments.append({
                     "audio_path": a_path,
                     "image_path": i_path,
@@ -1497,7 +1677,8 @@ def make_video():
                 opener_path, outro_path, downloaded_tease_segments,
                 output_path, intro_video_path, outro_video_path,
                 audio_start_offset=audio_start_offset,
-                music_url=music_url
+                music_url=music_url,
+                panorama_path=panorama_path
             )
             print("Synced social video built successfully")
 
